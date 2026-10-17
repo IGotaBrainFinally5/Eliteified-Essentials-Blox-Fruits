@@ -88,8 +88,10 @@ local State = {
     AutoTryLuck        = false,
     AutoPray           = false,
     CombatMode         = "Melee",
-    AttackDelayMs      = 0.12,
+    AttackDelayMs      = 0.05,
     TweenSpeed         = 250,
+    FarmDistance       = 15,   -- studs above NPC while farming (0-30)
+    FastAttack         = true, -- rapid M1 clicks while farming
     BringEnabled       = false,
     BringRange         = 100,
     BringMaxTargets    = 5,
@@ -1246,6 +1248,14 @@ local function stageWindow()
     end
 
     function Window:Destroy()
+        -- Stop farm movement immediately; full Cleanup (task cancel, GUI destroy) stays delayed
+        FarmRuntime.running = false
+        FarmRuntime.generation = FarmRuntime.generation + 1
+        pcall(function()
+            if type(cancelFarmTween) == "function" then
+                cancelFarmTween()
+            end
+        end)
         tween(Root, 0.25, { Size = UDim2.fromOffset(W, 0) }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
         task.delay(0.28, function()
             Cleanup()
@@ -1345,6 +1355,27 @@ local function stageFarming()
         Callback = function(v)
             State.TweenSpeed = v
             log("INFO", "Tween speed: " .. tostring(math.floor(v + 0.5)))
+        end,
+    })
+
+    Farming:AddSlider({
+        Name = "Farm Distance",
+        Description = "Height above NPC while farming (studs)",
+        Min = 0, Max = 30, Step = 1, Default = State.FarmDistance,
+        Format = function(v) return tostring(math.floor(v + 0.5)) .. " studs" end,
+        Callback = function(v)
+            State.FarmDistance = v
+            log("INFO", "Farm distance: " .. tostring(math.floor(v + 0.5)))
+        end,
+    })
+
+    Farming:AddToggle({
+        Name = "Fast Attack",
+        Description = "Rapid M1 clicks while farming",
+        Default = State.FastAttack == true,
+        Callback = function(on)
+            State.FastAttack = on
+            log("INFO", "Fast Attack: " .. tostring(on))
         end,
     })
 
@@ -1651,6 +1682,12 @@ local function stageFarming()
             State.BasicFarm = nil
             FarmRuntime.generation = FarmRuntime.generation + 1
         end
+        -- F2: every Stop All branch cancels movement + restores saved anchored state
+        pcall(function()
+            if type(cancelFarmTween) == "function" then
+                cancelFarmTween()
+            end
+        end)
         log("OK", "Stop All: modes cleared, UI synced, gen=" .. tostring(FarmRuntime.generation))
         Notify("Farming", "All modes stopped", 3, T.Danger)
     end)
@@ -1753,9 +1790,7 @@ local function tweenTo(cf, speed, gen)
     if gen and gen ~= FarmRuntime.generation then return false end
 
     local dist = (hrp.Position - cf.Position).Magnitude
-    -- Duration follows configured speed: t = dist / speed
-    -- No max-duration cap (a 3.5s cap made long trips far faster than the selected speed).
-    -- Tiny minimum only avoids a zero-length tween when already at the target.
+    -- Duration follows configured speed: t = dist / speed (no max cap that defeats the slider)
     local t = dist / speed
     if t < 0.05 then t = 0.05 end
 
@@ -1765,25 +1800,18 @@ local function tweenTo(cf, speed, gen)
         hrp = hrp,
         wasAnchored = wasAnchored,
     }
+
+    -- Own the move slot before any state change; every exit path must release or hand off via cancel.
     FarmRuntime.move = move
+    FarmRuntime.activeTween = nil
 
-    pcall(function() hrp.Anchored = true end)
-
-    local tw = TweenService:Create(hrp, TweenInfo.new(t, Enum.EasingStyle.Linear), { CFrame = cf })
-    move.tween = tw
-    FarmRuntime.activeTween = tw
-
-    -- Play + wait; cancellation or errors must still hit the restore path below
-    local waitOk = pcall(function()
-        tw:Play()
-        tw.Completed:Wait()
-    end)
-
-    -- If we still own this move, clear refs and restore anchor.
-    -- If cancelFarmTween already ran, FarmRuntime.move ~= move and restore already happened.
-    if FarmRuntime.move == move then
+    local function releaseIfOwner()
+        if FarmRuntime.move ~= move then
+            return -- cancelFarmTween / newer move already cleaned up
+        end
         FarmRuntime.move = nil
-        if FarmRuntime.activeTween == tw then
+        local ownedTw = move.tween
+        if FarmRuntime.activeTween == ownedTw then
             FarmRuntime.activeTween = nil
         end
         if hrp.Parent then
@@ -1791,17 +1819,62 @@ local function tweenTo(cf, speed, gen)
         end
     end
 
-    if not waitOk then return false end
+    -- F1: Create, Play, and Wait are all inside pcall so failures cannot skip restore
+    local ok = pcall(function()
+        hrp.Anchored = true
+
+        local tw = TweenService:Create(
+            hrp,
+            TweenInfo.new(t, Enum.EasingStyle.Linear),
+            { CFrame = cf }
+        )
+        move.tween = tw
+        FarmRuntime.activeTween = tw
+        tw:Play()
+        tw.Completed:Wait()
+    end)
+
+    -- Always release if we still own the slot (does not rely solely on Completed resuming)
+    releaseIfOwner()
+
+    if not ok then return false end
     if gen and gen ~= FarmRuntime.generation then return false end
     return true
 end
 
--- EE v1.4 ADDITION: safe attack wait from UI delay value
+local function getFarmHeight()
+    local h = tonumber(State.FarmDistance)
+    if h == nil then h = 15 end
+    if h < 0 then h = 0 end
+    if h > 30 then h = 30 end
+    return h
+end
+
+-- Keep character above a target root while farming (after tween has finished)
+local function holdAboveTarget(targetRoot)
+    local char, hrp = getCharacter()
+    if not char or not hrp or not targetRoot or not targetRoot.Parent then return false end
+    local height = getFarmHeight()
+    local ok = pcall(function()
+        hrp.Anchored = true
+        hrp.CFrame = targetRoot.CFrame * CFrame.new(0, height, 0)
+    end)
+    return ok
+end
+
+local function releaseFarmHold()
+    local char, hrp = getCharacter()
+    if hrp and hrp.Parent then
+        pcall(function() hrp.Anchored = false end)
+    end
+end
+
+-- EE v1.4: attack wait from UI delay (lower floor when Fast Attack is on)
 local function attackWait()
-    -- UI stores 0-5 labeled ms; clamp to a practical minimum so the client does not spin
-    local sec = tonumber(State.AttackDelayMs) or 0.12
-    if sec > 5 then sec = sec / 1000 end -- allow accidental whole-ms entry
-    sec = math.max(0.05, math.min(5, sec))
+    local sec = tonumber(State.AttackDelayMs) or 0.05
+    if sec > 5 then sec = sec / 1000 end
+    local minWait = State.FastAttack and 0.03 or 0.05
+    sec = math.max(minWait, math.min(5, sec))
     task.wait(sec)
 end
 
@@ -1866,6 +1939,58 @@ local function attackOnce()
         VirtualUser:CaptureController()
         VirtualUser:ClickButton1(Vector2.new())
     end)
+end
+
+-- Fast M1: burst of clicks (or single click when Fast Attack is off)
+local function doFarmAttack()
+    if State.FastAttack then
+        for _ = 1, 4 do
+            attackOnce()
+            task.wait(0.03)
+        end
+    else
+        attackOnce()
+    end
+end
+
+-- Shared: tween above target, hold height, attack while tracking mob
+local function farmCombatOnTarget(mob, gen, modeName)
+    local root = mob:FindFirstChild("HumanoidRootPart")
+    local hum  = mob:FindFirstChildOfClass("Humanoid")
+    if not root or not hum or hum.Health <= 0 then return end
+
+    equipBestTool()
+    setNoCollide(mob, true)
+    pcall(function()
+        root.Size = Vector3.new(40, 40, 40)
+        root.Transparency = 1
+        root.CanCollide = false
+        hum.WalkSpeed = 0
+        hum.JumpPower = 0
+    end)
+
+    local height = getFarmHeight()
+    State.Status.CurrentTarget = mob.Name
+    if not tweenTo(root.CFrame * CFrame.new(0, height, 0), nil, gen) then
+        return
+    end
+    if gen ~= FarmRuntime.generation or State.BasicFarm ~= modeName then
+        releaseFarmHold()
+        return
+    end
+
+    State.Status.CurrentAction = "attacking"
+    local clicks = State.FastAttack and 24 or 10
+    for _ = 1, clicks do
+        if gen ~= FarmRuntime.generation or State.BasicFarm ~= modeName then break end
+        if State.FarmPaused then break end
+        if not mob.Parent or not root.Parent or hum.Health <= 0 then break end
+
+        holdAboveTarget(root)
+        doFarmAttack()
+        attackWait()
+    end
+    releaseFarmHold()
 end
 
 local function setNoCollide(model, state)
