@@ -1,17 +1,21 @@
 --[[
-    Eliteified Essentials (BLOX FRUITS) - v1.4
+    Eliteified Essentials (BLOX FRUITS) - v1.4 (stability)
     UI Framework + Gameplay Automation
 
-    v1.3: Farming loops for Bones / Cake / Nearest / Levels + Bones Options
-    v1.4: Combat Settings UI, Bring Enemies config UI (no forced pull),
-          Bones expandable section, mode-sync guard, Farming diagnostics,
-          Clear Log / Stop All, pause + simple settings save.
+    v1.3: Farming loops + Bones Options
+    v1.4: Combat/Bring UI, diagnostics, Clear Log / Stop All
+    v1.4 stability:
+      - Single synchronous writer for State.BasicFarm (no async mode races)
+      - Cancel in-flight farm tweens; generation token aborts stale ticks
+      - TweenSpeed is the only movement speed source (no hardcoded 280/300)
+      - Bones options shown under Bones when ON (no separate dropdown)
+      - State.Effects defaults OFF (UI portal FX only — not engine combat anim)
+      - Honest equipped-item / Haki / mode-match status (Unknown when unverified)
 
     Diagnostics: bottom-left panel + [EE] console lines.
-    If nothing prints, the paste was truncated - re-copy the entire file.
 ]]
 
-print("[EE] Script started - Eliteified Essentials v1.4")
+print("[EE] Script started - Eliteified Essentials v1.4 (stability)")
 
 ----------------------------------------------------------------
 -- 1. CONFIG
@@ -77,18 +81,18 @@ local LocalPlayer, Gui, ParentUsed
 -- BasicFarm is the ONE shared state for the Basic Farms toggles.
 -- It is "Bones", "Cake", "Nearest", "Levels", or nil (nothing selected).
 local State = {
-    Effects            = true,
+    -- EE v1.4: UI portal/glow FX only (NOT Blox Fruits combat animations). Default OFF for phones.
+    Effects            = false,
     BasicFarm          = nil,
     AutoRandomSurprise = false,
     AutoTryLuck        = false,
     AutoPray           = false,
-    -- EE v1.4 ADDITION: combat / bring / status (UI + state)
-    CombatMode         = "Melee",       -- Melee | Blox Fruits | Sword | Gun
-    AttackDelayMs      = 0.12,          -- EE v1.4: UI range 0.0-5.0 (labeled ms); loops clamp safely
-    TweenSpeed         = 250,           -- 50-300
-    BringEnabled       = false,         -- UI config only; no forced NPC pull in v1.4
-    BringRange         = 100,           -- 25-500 studs
-    BringMaxTargets    = 5,             -- number 2-10, or math.huge for All
+    CombatMode         = "Melee",
+    AttackDelayMs      = 0.12,
+    TweenSpeed         = 250,
+    BringEnabled       = false,
+    BringRange         = 100,
+    BringMaxTargets    = 5,
     FarmPaused         = false,
     Status = {
         ActiveMode      = "none",
@@ -97,20 +101,28 @@ local State = {
         LastError       = "-",
         BringStatus     = "disabled",
         EnemiesSelected = 0,
+        EquippedItem    = "-",
+        DetectedCategory = "Unknown",
+        ModeMatch       = "Unknown",
+        HakiStatus      = "Unknown",
     },
 }
 local Connections = {}
 local Animators   = {}
 local Window      = { Tabs = {}, Selected = nil, Minimized = false }
-local Notify      = function() end -- replaced once the GUI exists
-local FarmRuntime = { running = false, task = nil }
--- EE v1.4 ADDITION: handles for Stop All / mode sync (filled in stageFarming)
+local Notify      = function() end
+-- generation: incremented on every mode change / Stop All so stale tween waits abort
+local FarmRuntime = {
+    running = false,
+    task = nil,
+    activeTween = nil,
+    generation = 0,
+}
 local FarmUI = {
     modeToggles = {},
-    syncing     = false,
-    bonesExpanded = false,
-    bonesPanel  = nil,
+    bonesOptionRows = {},
     statusLabels = {},
+    setFarmMode = nil, -- filled in stageFarming; sole writer of BasicFarm from UI
 }
 
 local function connect(signal, fn)
@@ -312,6 +324,11 @@ end
 local function Cleanup()
     pcall(function()
         FarmRuntime.running = false
+        FarmRuntime.generation = FarmRuntime.generation + 1
+        if FarmRuntime.activeTween then
+            pcall(function() FarmRuntime.activeTween:Cancel() end)
+            FarmRuntime.activeTween = nil
+        end
         if FarmRuntime.task then
             pcall(function() task.cancel(FarmRuntime.task) end)
             FarmRuntime.task = nil
@@ -438,7 +455,14 @@ local function CreateToggle(parent, opts)
     function object:Set(value, silent)
         state = value and true or false
         render(false)
-        if not silent and opts.Callback then task.spawn(opts.Callback, state) end
+        -- EE v1.4 stability: SyncCallback runs inline (needed for farm mode; avoids task.spawn races)
+        if not silent and opts.Callback then
+            if opts.SyncCallback then
+                opts.Callback(state)
+            else
+                task.spawn(opts.Callback, state)
+            end
+        end
     end
     function object:Get() return state end
 
@@ -1260,8 +1284,8 @@ local function stageHome()
     Home:AddSection("Interface")
     Home:AddToggle({
         Name = "Animated Effects",
-        Description = "Portal swirl and glow animations",
-        Default = true,
+        Description = "UI portal swirl/glow only (not game combat animations)",
+        Default = false, -- EE v1.4: OFF by default for mobile performance
         Callback = function(on) State.Effects = on end,
     })
 
@@ -1392,153 +1416,133 @@ local function stageFarming()
     refreshBringStatus()
 
     ----------------------------------------------------------------
-    -- Basic Farms (mutually exclusive) + mode sync guard
+    -- Basic Farms — single synchronous writer for State.BasicFarm
     ----------------------------------------------------------------
     Farming:AddSection("Basic Farms")
 
     local FARM_OPTIONS = { "Bones", "Cake", "Nearest", "Levels" }
     local farmToggles = FarmUI.modeToggles
+    local bonesOptionRows = FarmUI.bonesOptionRows
 
-    local function syncFarmToggles()
-        FarmUI.syncing = true
-        for name, toggle in pairs(farmToggles) do
-            local shouldBeOn = (State.BasicFarm == name)
-            if toggle:Get() ~= shouldBeOn then
-                toggle:Set(shouldBeOn, true) -- silent
+    -- EE v1.4 stability: ONLY function allowed to change BasicFarm from UI
+    local function setFarmMode(newMode, reason)
+        local prev = State.BasicFarm
+        if newMode ~= nil and newMode ~= "Bones" and newMode ~= "Cake"
+            and newMode ~= "Nearest" and newMode ~= "Levels" then
+            log("WARN", "setFarmMode rejected invalid mode: " .. tostring(newMode))
+            return
+        end
+        if prev == newMode then
+            -- still refresh UI visibility
+        else
+            State.BasicFarm = newMode
+            FarmRuntime.generation = FarmRuntime.generation + 1
+            cancelFarmTween()
+            log("INFO", string.format(
+                "Mode change: %s -> %s (reason: %s, gen=%d)",
+                tostring(prev or "none"), tostring(newMode or "none"),
+                tostring(reason or "?"), FarmRuntime.generation
+            ))
+        end
+        State.Status.ActiveMode = State.BasicFarm or "none"
+        State.Status.CurrentAction = State.BasicFarm and "idle" or "stopped"
+        if not State.BasicFarm then
+            State.Status.CurrentTarget = "-"
+        end
+
+        -- Sync toggle visuals WITHOUT invoking callbacks (silent Set)
+        for _, name in ipairs(FARM_OPTIONS) do
+            local toggle = farmToggles[name]
+            if toggle then
+                local should = (State.BasicFarm == name)
+                if toggle:Get() ~= should then
+                    toggle:Set(should, true)
+                end
             end
         end
-        FarmUI.syncing = false
-        State.Status.ActiveMode = State.BasicFarm or "none"
-        if FarmUI.statusLabels.ActiveMode then
-            FarmUI.statusLabels.ActiveMode.Text = "Active Mode: " .. State.Status.ActiveMode
+
+        -- Bones sub-options: visible only when Bones is the active mode
+        local showBonesOpts = (State.BasicFarm == "Bones")
+        for _, row in pairs(bonesOptionRows) do
+            if row and row.Instance then
+                row.Instance.Visible = showBonesOpts
+            end
+        end
+
+        if FarmUI.refreshStatusUI then pcall(FarmUI.refreshStatusUI) end
+        if prev ~= newMode then
+            if newMode then
+                Notify("Farming", "Mode: " .. newMode, 3, T.Blue)
+            else
+                Notify("Farming", "All farms stopped", 3, T.TextDim)
+            end
         end
     end
+    FarmUI.setFarmMode = setFarmMode
 
     for _, name in ipairs(FARM_OPTIONS) do
         farmToggles[name] = Farming:AddToggle({
             Name = name,
             Default = false,
+            SyncCallback = true, -- critical: no task.spawn race
             Callback = function(on)
-                if FarmUI.syncing then return end -- EE v1.4: re-entrancy guard
+                -- Click handler: derive desired mode from THIS toggle only
                 if on then
-                    State.BasicFarm = name
-                elseif State.BasicFarm == name then
-                    State.BasicFarm = nil
-                end
-                -- never leave BasicFarm pointing at a different mode than the click target
-                if on and State.BasicFarm ~= name then
-                    State.BasicFarm = name
-                end
-                syncFarmToggles()
-                log("INFO", "Basic Farm: " .. tostring(State.BasicFarm or "none"))
-                if State.BasicFarm then
-                    Notify("Farming", "Mode: " .. State.BasicFarm, 3, T.Blue)
+                    setFarmMode(name, "user toggle ON " .. name)
                 else
-                    Notify("Farming", "All farms stopped", 3, T.TextDim)
+                    -- only clear if this mode was the active one
+                    if State.BasicFarm == name then
+                        setFarmMode(nil, "user toggle OFF " .. name)
+                    else
+                        -- desync visual: force this toggle off without touching BasicFarm
+                        if farmToggles[name] then farmToggles[name]:Set(false, true) end
+                    end
                 end
             end,
         })
     end
 
-    ----------------------------------------------------------------
-    -- EE v1.4 ADDITION: Bones expandable section under Bones
-    ----------------------------------------------------------------
-    Farming:AddSection("Bones Settings")
-
-    local bonesExpandBtn = new("TextButton", {
-        Name = "BonesExpand", Text = "", AutoButtonColor = false,
-        BackgroundColor3 = T.Surface, Size = UDim2.new(1, 0, 0, 36),
-        Parent = Farming.Page,
-    }, { corner(10), stroke(T.Stroke, 1, 0.45) })
-    pcall(function()
-        local n = 0
-        for _, ch in ipairs(Farming.Page:GetChildren()) do
-            if ch:IsA("GuiObject") and typeof(ch.LayoutOrder) == "number" then
-                n = math.max(n, ch.LayoutOrder)
-            end
-        end
-        bonesExpandBtn.LayoutOrder = n + 1
-    end)
-
-    local bonesExpandLabel = new("TextLabel", {
-        BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
-        Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = T.Text,
-        Text = "Bones Settings  [+]", Parent = bonesExpandBtn,
-    })
-
-    local bonesPanel = new("Frame", {
-        Name = "BonesPanel", BackgroundTransparency = 1,
-        Size = UDim2.new(1, 0, 0, 0), Visible = false, ClipsDescendants = true,
-        Parent = Farming.Page,
-    }, {
-        new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
-    })
-    pcall(function()
-        bonesPanel.LayoutOrder = bonesExpandBtn.LayoutOrder + 1
-    end)
-    FarmUI.bonesPanel = bonesPanel
-
-    local function setBonesExpanded(open)
-        FarmUI.bonesExpanded = open
-        bonesPanel.Visible = open
-        if open then
-            bonesPanel.Size = UDim2.new(1, 0, 0, 180)
-            bonesExpandLabel.Text = "Bones Settings  [-]"
-        else
-            bonesPanel.Size = UDim2.new(1, 0, 0, 0)
-            bonesExpandLabel.Text = "Bones Settings  [+]"
-        end
-    end
-    setBonesExpanded(false)
-
-    connect(bonesExpandBtn.MouseButton1Click, function()
-        setBonesExpanded(not FarmUI.bonesExpanded)
-        -- expand/collapse only — does not change BasicFarm
-    end)
-    connect(bonesExpandBtn.MouseEnter, function()
-        tween(bonesExpandBtn, 0.15, { BackgroundColor3 = T.SurfaceHover })
-    end)
-    connect(bonesExpandBtn.MouseLeave, function()
-        tween(bonesExpandBtn, 0.15, { BackgroundColor3 = T.Surface })
-    end)
-
-    CreateToggle(bonesPanel, {
+    -- Bones options directly under Bones (hidden unless Bones mode active)
+    local b1 = CreateToggle(Farming.Page, {
         Name = "Auto Random Surprise",
         Description = "Death King - 50 Bones per roll",
         Default = false,
-        LayoutOrder = 1,
         Callback = function(on)
             State.AutoRandomSurprise = on
             log("INFO", "Auto Random Surprise: " .. tostring(on))
         end,
     })
-    CreateToggle(bonesPanel, {
+    local b2 = CreateToggle(Farming.Page, {
         Name = "Auto Try Luck",
         Description = "Gravestone - Try Your Luck (night)",
         Default = false,
-        LayoutOrder = 2,
         Callback = function(on)
             State.AutoTryLuck = on
             log("INFO", "Auto Try Luck: " .. tostring(on))
         end,
     })
-    CreateToggle(bonesPanel, {
+    local b3 = CreateToggle(Farming.Page, {
         Name = "Auto Pray",
         Description = "Gravestone - Pray (night)",
         Default = false,
-        LayoutOrder = 3,
         Callback = function(on)
             State.AutoPray = on
             log("INFO", "Auto Pray: " .. tostring(on))
         end,
     })
-    new("TextLabel", {
-        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 18), LayoutOrder = 4,
-        Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = T.TextDim,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        Text = "Bones Status: options keep state when collapsed",
-        Parent = bonesPanel,
-    })
+    bonesOptionRows.Random = b1
+    bonesOptionRows.TryLuck = b2
+    bonesOptionRows.Pray = b3
+    -- place layout after mode toggles
+    pcall(function()
+        local base = 0
+        if farmToggles.Levels and farmToggles.Levels.Instance then
+            base = farmToggles.Levels.Instance.LayoutOrder
+        end
+        if b1.Instance then b1.Instance.LayoutOrder = base + 1; b1.Instance.Visible = false end
+        if b2.Instance then b2.Instance.LayoutOrder = base + 2; b2.Instance.Visible = false end
+        if b3.Instance then b3.Instance.LayoutOrder = base + 3; b3.Instance.Visible = false end
+    end)
 
     ----------------------------------------------------------------
     -- EE v1.4 ADDITION: Diagnostics + controls
@@ -1568,28 +1572,31 @@ local function stageFarming()
     addStatusLine("CurrentTarget", "Current Target: -")
     addStatusLine("CurrentAction", "Current Action: idle")
     addStatusLine("LastError", "Last Error: -")
+    addStatusLine("EquippedItem", "Equipped Item: -")
+    addStatusLine("ModeMatch", "Mode Match: Unknown")
+    addStatusLine("HakiStatus", "Haki: Unknown")
     addStatusLine("BringStatus", "Bring Enemies: disabled")
     addStatusLine("EnemiesSelected", "Enemies Selected: 0")
 
     local function refreshStatusUI()
         local S = State.Status
-        if FarmUI.statusLabels.ActiveMode then
-            FarmUI.statusLabels.ActiveMode.Text = "Active Mode: " .. tostring(S.ActiveMode)
-        end
-        if FarmUI.statusLabels.CurrentTarget then
-            FarmUI.statusLabels.CurrentTarget.Text = "Current Target: " .. tostring(S.CurrentTarget)
-        end
-        if FarmUI.statusLabels.CurrentAction then
-            FarmUI.statusLabels.CurrentAction.Text = "Current Action: " .. tostring(S.CurrentAction)
-        end
-        if FarmUI.statusLabels.LastError then
-            FarmUI.statusLabels.LastError.Text = "Last Error: " .. tostring(S.LastError)
-        end
-        if FarmUI.statusLabels.BringStatus then
-            FarmUI.statusLabels.BringStatus.Text = "Bring Enemies: " .. tostring(S.BringStatus)
-        end
-        if FarmUI.statusLabels.EnemiesSelected then
-            FarmUI.statusLabels.EnemiesSelected.Text = "Enemies Selected: " .. tostring(S.EnemiesSelected)
+        local map = {
+            ActiveMode = "Active Mode: " .. tostring(S.ActiveMode),
+            CurrentTarget = "Current Target: " .. tostring(S.CurrentTarget),
+            CurrentAction = "Current Action: " .. tostring(S.CurrentAction),
+            LastError = "Last Error: " .. tostring(S.LastError),
+            EquippedItem = "Equipped Item: " .. tostring(S.EquippedItem),
+            ModeMatch = "Mode Match: " .. tostring(S.ModeMatch)
+                .. " (selected " .. tostring(State.CombatMode)
+                .. " / detected " .. tostring(S.DetectedCategory) .. ")",
+            HakiStatus = "Haki: " .. tostring(S.HakiStatus),
+            BringStatus = "Bring Enemies: " .. tostring(S.BringStatus),
+            EnemiesSelected = "Enemies Selected: " .. tostring(S.EnemiesSelected),
+        }
+        for key, text in pairs(map) do
+            if FarmUI.statusLabels[key] then
+                FarmUI.statusLabels[key].Text = text
+            end
         end
     end
     FarmUI.refreshStatusUI = refreshStatusUI
@@ -1641,18 +1648,18 @@ local function stageFarming()
         stopBtn.LayoutOrder = clearBtn.LayoutOrder + 1
     end)
     connect(stopBtn.MouseButton1Click, function()
-        State.BasicFarm = nil
         State.AutoRandomSurprise = false
         State.AutoTryLuck = false
         State.AutoPray = false
         State.FarmPaused = false
-        State.Status.ActiveMode = "none"
-        State.Status.CurrentTarget = "-"
-        State.Status.CurrentAction = "stopped"
         State.Status.EnemiesSelected = 0
-        syncFarmToggles()
-        if FarmUI.refreshStatusUI then FarmUI.refreshStatusUI() end
-        log("OK", "Stop All: modes cleared, UI synced")
+        if FarmUI.setFarmMode then
+            FarmUI.setFarmMode(nil, "Stop All")
+        else
+            State.BasicFarm = nil
+            FarmRuntime.generation = FarmRuntime.generation + 1
+        end
+        log("OK", "Stop All: modes cleared, UI synced, gen=" .. tostring(FarmRuntime.generation))
         Notify("Farming", "All modes stopped", 3, T.Danger)
     end)
 
@@ -1724,16 +1731,34 @@ local function getCommF()
     return remotes:FindFirstChild("CommF_")
 end
 
-local function tweenTo(cf, speed)
+-- EE v1.4 stability: cancel any in-flight farm movement tween
+local function cancelFarmTween()
+    local tw = FarmRuntime.activeTween
+    FarmRuntime.activeTween = nil
+    if tw then
+        pcall(function() tw:Cancel() end)
+    end
+end
+
+local function tweenTo(cf, speed, gen)
     local char, hrp = getCharacter()
     if not char or not hrp then return false end
-    -- EE v1.4: prefer State.TweenSpeed when caller omits speed
-    speed = speed or State.TweenSpeed or 250
+    -- Single source of truth for speed (ignore stale hardcoded callers)
+    speed = State.TweenSpeed or 250
+    if speed < 50 then speed = 50 end
+    if speed > 300 then speed = 300 end
+    cancelFarmTween()
+    if gen and gen ~= FarmRuntime.generation then return false end
     local dist = (hrp.Position - cf.Position).Magnitude
     local t = math.max(0.15, math.min(4, dist / speed))
     local tw = TweenService:Create(hrp, TweenInfo.new(t, Enum.EasingStyle.Linear), { CFrame = cf })
+    FarmRuntime.activeTween = tw
     tw:Play()
     tw.Completed:Wait()
+    if FarmRuntime.activeTween == tw then
+        FarmRuntime.activeTween = nil
+    end
+    if gen and gen ~= FarmRuntime.generation then return false end
     return true
 end
 
@@ -1758,6 +1783,48 @@ local function equipBestTool()
             return
         end
     end
+end
+
+-- EE v1.4: honest equipment category probe (status only; does not switch tools)
+local function updateEquipmentStatus()
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if not tool then
+        State.Status.EquippedItem = "(none)"
+        State.Status.DetectedCategory = "Unknown"
+        State.Status.ModeMatch = "Unknown"
+    else
+        State.Status.EquippedItem = tool.Name
+        local n = string.lower(tool.Name)
+        local cat = "Unknown"
+        if string.find(n, "gun", 1, true) or string.find(n, "rifle", 1, true)
+            or string.find(n, "pistol", 1, true) or string.find(n, "cannon", 1, true) then
+            cat = "Gun"
+        elseif string.find(n, "sword", 1, true) or string.find(n, "blade", 1, true)
+            or string.find(n, "katana", 1, true) or string.find(n, "cutlass", 1, true) then
+            cat = "Sword"
+        elseif string.find(n, "fruit", 1, true) or string.find(n, "dough", 1, true)
+            or string.find(n, "dragon", 1, true) then
+            cat = "Blox Fruits"
+        elseif string.find(n, "combat", 1, true) or string.find(n, "melee", 1, true)
+            or string.find(n, "black leg", 1, true) or string.find(n, "electro", 1, true)
+            or string.find(n, "fishman", 1, true) or string.find(n, "dragon claw", 1, true)
+            or string.find(n, "superhuman", 1, true) or string.find(n, "death step", 1, true)
+            or string.find(n, "sharkman", 1, true) or string.find(n, "godhuman", 1, true)
+            or string.find(n, "sanguine", 1, true) then
+            cat = "Melee"
+        end
+        State.Status.DetectedCategory = cat
+        if cat == "Unknown" then
+            State.Status.ModeMatch = "Unknown"
+        elseif cat == State.CombatMode then
+            State.Status.ModeMatch = "Match"
+        else
+            State.Status.ModeMatch = "Mismatch"
+        end
+    end
+    -- Haki: no reliable client field in this script — stay honest
+    State.Status.HakiStatus = "Unknown"
 end
 
 local function attackOnce()
@@ -1850,7 +1917,7 @@ local function doGravestone(action)
     local char, hrp = getCharacter()
     if not hrp then return end
     log("INFO", "Moving to Gravestone for " .. action)
-    tweenTo(GRAVESTONE_CF * CFrame.new(0, 3, 4), 300)
+    tweenTo(GRAVESTONE_CF * CFrame.new(0, 3, 4), nil, FarmRuntime.generation)
     task.wait(0.4)
     local comm = getCommF()
     local ok, err = pcall(function()
@@ -1884,15 +1951,17 @@ local function doGravestone(action)
 end
 
 local function farmBones()
+    local gen = FarmRuntime.generation
     if State.AutoRandomSurprise then doRandomSurprise() end
     if State.AutoTryLuck then doGravestone("TryLuck") end
     if State.AutoPray then doGravestone("Pray") end
+    if gen ~= FarmRuntime.generation or State.BasicFarm ~= "Bones" then return end
 
     local mob = findNearestEnemy(isBoneMob)
     if not mob then
         local char, hrp = getCharacter()
         if hrp and (hrp.Position - Vector3.new(-9500, 150, 5800)).Magnitude > 400 then
-            tweenTo(CFrame.new(-9508, 142, 5737), 280)
+            tweenTo(CFrame.new(-9508, 142, 5737), nil, gen)
         end
         return
     end
@@ -1913,9 +1982,9 @@ local function farmBones()
 
     State.Status.CurrentTarget = mob.Name
     State.Status.CurrentAction = "attacking"
-    tweenTo(root.CFrame * CFrame.new(0, 25, 0))
+    if not tweenTo(root.CFrame * CFrame.new(0, 25, 0), nil, gen) then return end
     for _ = 1, 8 do
-        if not State.BasicFarm or State.BasicFarm ~= "Bones" then break end
+        if gen ~= FarmRuntime.generation or State.BasicFarm ~= "Bones" then break end
         if State.FarmPaused then break end
         if not mob.Parent or hum.Health <= 0 then break end
         attackOnce()
@@ -1924,6 +1993,8 @@ local function farmBones()
 end
 
 local function farmNearest()
+    local gen = FarmRuntime.generation
+    if State.BasicFarm ~= "Nearest" and State.BasicFarm ~= "Levels" then return end
     local mob = findNearestEnemy(nil)
     if not mob then
         State.Status.CurrentTarget = "-"
@@ -1944,9 +2015,10 @@ local function farmNearest()
 
     State.Status.CurrentTarget = mob.Name
     State.Status.CurrentAction = "attacking"
-    tweenTo(root.CFrame * CFrame.new(0, 20, 0))
+    if not tweenTo(root.CFrame * CFrame.new(0, 20, 0), nil, gen) then return end
     for _ = 1, 6 do
-        if not State.BasicFarm or State.BasicFarm ~= "Nearest" then break end
+        if gen ~= FarmRuntime.generation then break end
+        if State.BasicFarm ~= "Nearest" and State.BasicFarm ~= "Levels" then break end
         if State.FarmPaused then break end
         if not mob.Parent or hum.Health <= 0 then break end
         attackOnce()
@@ -1955,18 +2027,20 @@ local function farmNearest()
 end
 
 local function farmCake()
+    local gen = FarmRuntime.generation
     local comm = getCommF()
     if comm then
         pcall(function()
             comm:InvokeServer("CakePrinceSpawner")
         end)
     end
+    if gen ~= FarmRuntime.generation or State.BasicFarm ~= "Cake" then return end
 
     local prince = findCakePrince()
     if not prince then
         local char, hrp = getCharacter()
         if hrp and (hrp.Position - Vector3.new(-2100, 70, -12000)).Magnitude > 500 then
-            tweenTo(CFrame.new(-2092, 70, -12160), 280)
+            tweenTo(CFrame.new(-2092, 70, -12160), nil, gen)
         end
         return
     end
@@ -1987,9 +2061,9 @@ local function farmCake()
 
     State.Status.CurrentTarget = prince.Name
     State.Status.CurrentAction = "attacking"
-    tweenTo(root.CFrame * CFrame.new(0, 30, 0))
+    if not tweenTo(root.CFrame * CFrame.new(0, 30, 0), nil, gen) then return end
     for _ = 1, 10 do
-        if not State.BasicFarm or State.BasicFarm ~= "Cake" then break end
+        if gen ~= FarmRuntime.generation or State.BasicFarm ~= "Cake" then break end
         if State.FarmPaused then break end
         if not prince.Parent then break end
         if hum and hum.Health <= 0 then break end
@@ -2017,6 +2091,8 @@ local function startFarmController()
         while FarmRuntime.running do
             local mode = State.BasicFarm
             State.Status.ActiveMode = mode or "none"
+
+            pcall(updateEquipmentStatus)
 
             if State.FarmPaused then
                 State.Status.CurrentAction = "paused"
