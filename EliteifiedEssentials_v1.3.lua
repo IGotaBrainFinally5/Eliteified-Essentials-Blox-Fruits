@@ -117,6 +117,8 @@ local FarmRuntime = {
     task = nil,
     activeTween = nil,
     generation = 0,
+    -- move: { tween, hrp, wasAnchored } — owned by the active tweenTo; cleared on finish/cancel
+    move = nil,
 }
 local FarmUI = {
     modeToggles = {},
@@ -325,9 +327,15 @@ local function Cleanup()
     pcall(function()
         FarmRuntime.running = false
         FarmRuntime.generation = FarmRuntime.generation + 1
-        if FarmRuntime.activeTween then
-            pcall(function() FarmRuntime.activeTween:Cancel() end)
-            FarmRuntime.activeTween = nil
+        -- Inline move cleanup (cancelFarmTween is defined later in the file; do not depend on it here)
+        local tw = FarmRuntime.activeTween
+        local m = FarmRuntime.move
+        FarmRuntime.activeTween = nil
+        FarmRuntime.move = nil
+        if tw then pcall(function() tw:Cancel() end) end
+        if m and m.tween and m.tween ~= tw then pcall(function() m.tween:Cancel() end) end
+        if m and m.hrp and m.hrp.Parent then
+            pcall(function() m.hrp.Anchored = m.wasAnchored end)
         end
         if FarmRuntime.task then
             pcall(function() task.cancel(FarmRuntime.task) end)
@@ -1715,44 +1723,75 @@ local function getCommF()
     return remotes:FindFirstChild("CommF_")
 end
 
--- EE v1.4 stability: cancel any in-flight farm movement tween
+-- EE v1.4: cancel in-flight farm tween and always restore that move's anchored state
 local function cancelFarmTween()
+    local m = FarmRuntime.move
     local tw = FarmRuntime.activeTween
+    FarmRuntime.move = nil
     FarmRuntime.activeTween = nil
     if tw then
         pcall(function() tw:Cancel() end)
+    elseif m and m.tween then
+        pcall(function() m.tween:Cancel() end)
+    end
+    -- Restore only the HRP this move anchored; ignore if part is gone (respawn)
+    if m and m.hrp and m.hrp.Parent then
+        pcall(function() m.hrp.Anchored = m.wasAnchored end)
     end
 end
 
 local function tweenTo(cf, speed, gen)
     local char, hrp = getCharacter()
     if not char or not hrp then return false end
-    -- Only State.TweenSpeed controls farm movement (50-300). No island-travel system exists in this script.
-    speed = tonumber(State.TweenSpeed) or 250
+
+    -- Speed: optional explicit argument, else State.TweenSpeed (clamped to UI range 50-300)
+    speed = tonumber(speed) or tonumber(State.TweenSpeed) or 250
     if speed < 50 then speed = 50 end
     if speed > 300 then speed = 300 end
-    cancelFarmTween()
+
+    cancelFarmTween() -- finishes previous move (cancels + unanchors its HRP)
     if gen and gen ~= FarmRuntime.generation then return false end
 
     local dist = (hrp.Position - cf.Position).Magnitude
-    -- Cap duration so extreme distances cannot produce multi-second stacked motion
+    -- Duration follows configured speed: t = dist / speed
+    -- No max-duration cap (a 3.5s cap made long trips far faster than the selected speed).
+    -- Tiny minimum only avoids a zero-length tween when already at the target.
     local t = dist / speed
-    if t < 0.12 then t = 0.12 end
-    if t > 3.5 then t = 3.5 end
+    if t < 0.05 then t = 0.05 end
 
-    -- Anchor during tween so physics does not fight the CFrame tween (reduces fling)
     local wasAnchored = hrp.Anchored
+    local move = {
+        tween = nil,
+        hrp = hrp,
+        wasAnchored = wasAnchored,
+    }
+    FarmRuntime.move = move
+
     pcall(function() hrp.Anchored = true end)
 
     local tw = TweenService:Create(hrp, TweenInfo.new(t, Enum.EasingStyle.Linear), { CFrame = cf })
+    move.tween = tw
     FarmRuntime.activeTween = tw
-    tw:Play()
-    tw.Completed:Wait()
-    if FarmRuntime.activeTween == tw then
-        FarmRuntime.activeTween = nil
-    end
-    pcall(function() hrp.Anchored = wasAnchored end)
 
+    -- Play + wait; cancellation or errors must still hit the restore path below
+    local waitOk = pcall(function()
+        tw:Play()
+        tw.Completed:Wait()
+    end)
+
+    -- If we still own this move, clear refs and restore anchor.
+    -- If cancelFarmTween already ran, FarmRuntime.move ~= move and restore already happened.
+    if FarmRuntime.move == move then
+        FarmRuntime.move = nil
+        if FarmRuntime.activeTween == tw then
+            FarmRuntime.activeTween = nil
+        end
+        if hrp.Parent then
+            pcall(function() hrp.Anchored = wasAnchored end)
+        end
+    end
+
+    if not waitOk then return false end
     if gen and gen ~= FarmRuntime.generation then return false end
     return true
 end
