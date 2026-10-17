@@ -90,7 +90,7 @@ local State = {
     CombatMode         = "Melee",
     AttackDelayMs      = 0.05,
     TweenSpeed         = 250,
-    FarmDistance       = 15,   -- studs above NPC while farming (0-30)
+    FarmDistance       = 8,    -- studs above NPC while farming (0-30); lower = easier melee hits
     FastAttack         = true, -- rapid M1 clicks while farming
     BringEnabled       = false,
     BringRange         = 100,
@@ -1327,12 +1327,19 @@ local function stageFarming()
 
     Farming:AddCycle({
         Name = "Selected Mode",
-        Description = "Preferred loadout label (UI preference)",
+        Description = "Equips a matching tool from backpack when possible",
         Options = { "Melee", "Blox Fruits", "Sword", "Gun" },
         Default = State.CombatMode,
         Callback = function(v)
             State.CombatMode = v
             log("INFO", "Combat mode: " .. tostring(v))
+            -- Try to equip immediately when the user changes mode
+            pcall(function()
+                if type(equipBestTool) == "function" then
+                    equipBestTool()
+                end
+            end)
+            if FarmUI.refreshStatusUI then pcall(FarmUI.refreshStatusUI) end
         end,
     })
 
@@ -1775,6 +1782,12 @@ local function cancelFarmTween()
     if m and m.hrp and m.hrp.Parent then
         pcall(function() m.hrp.Anchored = m.wasAnchored end)
     end
+    -- Also clear any farm-hold anchor (stay-above-NPC) so mode changes never leave you frozen
+    pcall(function()
+        local char = LocalPlayer and LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then hrp.Anchored = false end
+    end)
 end
 
 local function tweenTo(cf, speed, gen)
@@ -1850,12 +1863,19 @@ local function getFarmHeight()
     return h
 end
 
--- Keep character above a target root while farming (after tween has finished)
+-- Keep character above a target root while farming (must be re-applied every tick)
 local function holdAboveTarget(targetRoot)
-    local char, hrp = getCharacter()
+    local char, hrp, hum = getCharacter()
     if not char or not hrp or not targetRoot or not targetRoot.Parent then return false end
     local height = getFarmHeight()
     local ok = pcall(function()
+        -- Kill velocity so physics does not pull you out of the hold
+        hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        if hum then
+            hum.PlatformStand = true
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+        end
         hrp.Anchored = true
         hrp.CFrame = targetRoot.CFrame * CFrame.new(0, height, 0)
     end)
@@ -1863,36 +1883,181 @@ local function holdAboveTarget(targetRoot)
 end
 
 local function releaseFarmHold()
-    local char, hrp = getCharacter()
+    local char, hrp, hum = getCharacter()
     if hrp and hrp.Parent then
-        pcall(function() hrp.Anchored = false end)
+        pcall(function()
+            hrp.Anchored = false
+            hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        end)
     end
+    if hum then
+        pcall(function()
+            hum.PlatformStand = false
+        end)
+    end
+end
+
+-- Expand NPC parts so M1 / touch range can register from farm height
+local function expandMobHitbox(mob)
+    if not mob then return end
+    pcall(function()
+        for _, part in ipairs(mob:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.Size = Vector3.new(70, 70, 70)
+                part.Transparency = 1
+                part.CanCollide = false
+                part.Massless = true
+            end
+        end
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.WalkSpeed = 0
+            hum.JumpPower = 0
+            pcall(function() hum.JumpHeight = 0 end)
+        end
+    end)
 end
 
 -- EE v1.4: attack wait from UI delay (lower floor when Fast Attack is on)
 local function attackWait()
     local sec = tonumber(State.AttackDelayMs) or 0.05
     if sec > 5 then sec = sec / 1000 end
-    local minWait = State.FastAttack and 0.03 or 0.05
+    local minWait = State.FastAttack and 0.02 or 0.04
     sec = math.max(minWait, math.min(5, sec))
     task.wait(sec)
 end
 
-local function equipBestTool()
-    local char = LocalPlayer.Character
-    if not char then return end
-    if char:FindFirstChildOfClass("Tool") then return end
-    local backpack = LocalPlayer:FindFirstChild("Backpack")
-    if not backpack then return end
-    for _, tool in ipairs(backpack:GetChildren()) do
-        if tool:IsA("Tool") then
-            pcall(function() tool.Parent = char end)
-            return
-        end
+-- Classify a tool name into Melee / Sword / Gun / Blox Fruits / Unknown
+local function categorizeToolName(name)
+    local n = string.lower(tostring(name or ""))
+    if n == "" then return "Unknown" end
+
+    -- Guns first (specific)
+    if string.find(n, "gun", 1, true) or string.find(n, "rifle", 1, true)
+        or string.find(n, "pistol", 1, true) or string.find(n, "cannon", 1, true)
+        or string.find(n, "musket", 1, true) or string.find(n, "flintlock", 1, true)
+        or string.find(n, "shotgun", 1, true) or string.find(n, "acidum", 1, true)
+        or string.find(n, "kabucha", 1, true) or string.find(n, "serpent bow", 1, true)
+        or string.find(n, "bazooka", 1, true) then
+        return "Gun"
     end
+
+    -- Swords
+    if string.find(n, "sword", 1, true) or string.find(n, "blade", 1, true)
+        or string.find(n, "katana", 1, true) or string.find(n, "cutlass", 1, true)
+        or string.find(n, "saber", 1, true) or string.find(n, "rapier", 1, true)
+        or string.find(n, "scythe", 1, true) or string.find(n, "trident", 1, true)
+        or string.find(n, "twin hooks", 1, true) or string.find(n, "shark anchor", 1, true)
+        or string.find(n, "dark dagger", 1, true) or string.find(n, "midnight blade", 1, true)
+        or string.find(n, "canvander", 1, true) or string.find(n, "buddy sword", 1, true)
+        or string.find(n, "tushita", 1, true) or string.find(n, "yama", 1, true)
+        or string.find(n, "shisui", 1, true) or string.find(n, "saddi", 1, true)
+        or string.find(n, "wando", 1, true) or string.find(n, "rengoku", 1, true)
+        or string.find(n, "koko", 1, true) or string.find(n, "spikey trident", 1, true)
+        or string.find(n, "hallow scythe", 1, true) or string.find(n, "fox lamp", 1, true)
+        or string.find(n, "pipe", 1, true) or string.find(n, "iron mace", 1, true)
+        or string.find(n, "triple katana", 1, true) or string.find(n, "dual katana", 1, true)
+        or string.find(n, "bisento", 1, true) or string.find(n, "soul cane", 1, true) then
+        return "Sword"
+    end
+
+    -- Fighting styles (Melee)
+    if string.find(n, "combat", 1, true) or string.find(n, "melee", 1, true)
+        or string.find(n, "black leg", 1, true) or string.find(n, "electro", 1, true)
+        or string.find(n, "fishman", 1, true) or string.find(n, "dragon claw", 1, true)
+        or string.find(n, "superhuman", 1, true) or string.find(n, "death step", 1, true)
+        or string.find(n, "sharkman", 1, true) or string.find(n, "godhuman", 1, true)
+        or string.find(n, "sanguine", 1, true) or string.find(n, "electric claw", 1, true)
+        or string.find(n, "dragon talon", 1, true) or string.find(n, "godhuman", 1, true)
+        or string.find(n, "fighting style", 1, true) then
+        return "Melee"
+    end
+
+    -- Blox Fruits (common fruit tool names / "Fruit")
+    if string.find(n, "fruit", 1, true) or string.find(n, "-fruit", 1, true)
+        or string.find(n, "dough", 1, true) or string.find(n, "dragon", 1, true)
+        or string.find(n, "venom", 1, true) or string.find(n, "control", 1, true)
+        or string.find(n, "shadow", 1, true) or string.find(n, "spirit", 1, true)
+        or string.find(n, "mammoth", 1, true) or string.find(n, "t-rex", 1, true)
+        or string.find(n, "leopard", 1, true) or string.find(n, "kitsune", 1, true)
+        or string.find(n, "gas", 1, true) or string.find(n, "yeti", 1, true)
+        or string.find(n, "gravity", 1, true) or string.find(n, "buddha", 1, true)
+        or string.find(n, "magma", 1, true) or string.find(n, "light", 1, true)
+        or string.find(n, "dark", 1, true) or string.find(n, "ice", 1, true)
+        or string.find(n, "flame", 1, true) or string.find(n, "quake", 1, true)
+        or string.find(n, "rumble", 1, true) or string.find(n, "portal", 1, true)
+        or string.find(n, "phoenix", 1, true) or string.find(n, "sound", 1, true)
+        or string.find(n, "spider", 1, true) or string.find(n, "love", 1, true)
+        or string.find(n, "rubber", 1, true) or string.find(n, "barrier", 1, true)
+        or string.find(n, "sand", 1, true) or string.find(n, "blizzard", 1, true) then
+        return "Blox Fruits"
+    end
+
+    return "Unknown"
 end
 
--- EE v1.4: honest equipment category probe (status only; does not switch tools)
+-- Equip a tool that matches State.CombatMode (unequips mismatch first)
+local function equipBestTool()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    local want = State.CombatMode or "Melee"
+
+    local function allTools()
+        local list = {}
+        for _, t in ipairs(char:GetChildren()) do
+            if t:IsA("Tool") then list[#list + 1] = t end
+        end
+        if backpack then
+            for _, t in ipairs(backpack:GetChildren()) do
+                if t:IsA("Tool") then list[#list + 1] = t end
+            end
+        end
+        return list
+    end
+
+    -- Prefer already-correct equipped tool
+    local equipped = char:FindFirstChildOfClass("Tool")
+    if equipped and categorizeToolName(equipped.Name) == want then
+        return equipped
+    end
+
+    -- Unequip wrong tool so we can equip the right category
+    if equipped and backpack then
+        pcall(function() equipped.Parent = backpack end)
+    end
+
+    -- Find best match for selected combat mode
+    local match, fallback = nil, nil
+    for _, tool in ipairs(allTools()) do
+        local cat = categorizeToolName(tool.Name)
+        if cat == want then
+            match = tool
+            break
+        end
+        if not fallback then
+            fallback = tool
+        end
+    end
+
+    local chosen = match or fallback
+    if not chosen then
+        log("WARN", "No tool found for Combat Mode: " .. tostring(want))
+        return nil
+    end
+
+    pcall(function() chosen.Parent = char end)
+    local now = char:FindFirstChildOfClass("Tool") or chosen
+    local cat = categorizeToolName(now.Name)
+    if cat == want then
+        log("INFO", "Equipped " .. now.Name .. " [" .. cat .. "] for mode " .. want)
+    else
+        log("WARN", "Equipped fallback " .. now.Name .. " [" .. cat .. "]; wanted " .. want)
+    end
+    return now
+end
+
+-- Status probe uses the same categorizer as equip
 local function updateEquipmentStatus()
     local char = LocalPlayer.Character
     local tool = char and char:FindFirstChildOfClass("Tool")
@@ -1902,25 +2067,7 @@ local function updateEquipmentStatus()
         State.Status.ModeMatch = "Unknown"
     else
         State.Status.EquippedItem = tool.Name
-        local n = string.lower(tool.Name)
-        local cat = "Unknown"
-        if string.find(n, "gun", 1, true) or string.find(n, "rifle", 1, true)
-            or string.find(n, "pistol", 1, true) or string.find(n, "cannon", 1, true) then
-            cat = "Gun"
-        elseif string.find(n, "sword", 1, true) or string.find(n, "blade", 1, true)
-            or string.find(n, "katana", 1, true) or string.find(n, "cutlass", 1, true) then
-            cat = "Sword"
-        elseif string.find(n, "fruit", 1, true) or string.find(n, "dough", 1, true)
-            or string.find(n, "dragon", 1, true) then
-            cat = "Blox Fruits"
-        elseif string.find(n, "combat", 1, true) or string.find(n, "melee", 1, true)
-            or string.find(n, "black leg", 1, true) or string.find(n, "electro", 1, true)
-            or string.find(n, "fishman", 1, true) or string.find(n, "dragon claw", 1, true)
-            or string.find(n, "superhuman", 1, true) or string.find(n, "death step", 1, true)
-            or string.find(n, "sharkman", 1, true) or string.find(n, "godhuman", 1, true)
-            or string.find(n, "sanguine", 1, true) then
-            cat = "Melee"
-        end
+        local cat = categorizeToolName(tool.Name)
         State.Status.DetectedCategory = cat
         if cat == "Unknown" then
             State.Status.ModeMatch = "Unknown"
@@ -1930,48 +2077,60 @@ local function updateEquipmentStatus()
             State.Status.ModeMatch = "Mismatch"
         end
     end
-    -- Haki: no reliable client field in this script — stay honest
     State.Status.HakiStatus = "Unknown"
 end
 
-local function attackOnce()
+local function attackOnce(tool)
     pcall(function()
         VirtualUser:CaptureController()
         VirtualUser:ClickButton1(Vector2.new())
     end)
-end
-
--- Fast M1: burst of clicks (or single click when Fast Attack is off)
-local function doFarmAttack()
-    if State.FastAttack then
-        for _ = 1, 4 do
-            attackOnce()
-            task.wait(0.03)
-        end
-    else
-        attackOnce()
+    -- Also activate the equipped tool (some weapons need this for M1)
+    if tool then
+        pcall(function() tool:Activate() end)
     end
 end
 
--- Shared: tween above target, hold height, attack while tracking mob
+-- Touch-interest helper: helps register hits when hitbox is expanded (if executor supports it)
+local function tryTouchHit(mob)
+    local char, hrp = getCharacter()
+    if not char or not hrp or not mob then return end
+    local root = mob:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    pcall(function()
+        if typeof(firetouchinterest) == "function" then
+            firetouchinterest(hrp, root, 0)
+            firetouchinterest(hrp, root, 1)
+        end
+    end)
+end
+
+-- Fast M1: burst of clicks + tool activate + touch interest
+local function doFarmAttack(tool, mob)
+    local n = State.FastAttack and 5 or 1
+    for _ = 1, n do
+        tryTouchHit(mob)
+        attackOnce(tool)
+        task.wait(State.FastAttack and 0.02 or 0.04)
+    end
+end
+
+-- Shared: tween above target, hold height, extended hitbox, attack while tracking mob
 local function farmCombatOnTarget(mob, gen, modeName)
     local root = mob:FindFirstChild("HumanoidRootPart")
     local hum  = mob:FindFirstChildOfClass("Humanoid")
     if not root or not hum or hum.Health <= 0 then return end
 
-    equipBestTool()
+    local tool = equipBestTool()
     setNoCollide(mob, true)
-    pcall(function()
-        root.Size = Vector3.new(40, 40, 40)
-        root.Transparency = 1
-        root.CanCollide = false
-        hum.WalkSpeed = 0
-        hum.JumpPower = 0
-    end)
+    expandMobHitbox(mob)
 
     local height = getFarmHeight()
     State.Status.CurrentTarget = mob.Name
+    State.Status.CurrentAction = "moving"
+
     if not tweenTo(root.CFrame * CFrame.new(0, height, 0), nil, gen) then
+        releaseFarmHold()
         return
     end
     if gen ~= FarmRuntime.generation or State.BasicFarm ~= modeName then
@@ -1979,18 +2138,25 @@ local function farmCombatOnTarget(mob, gen, modeName)
         return
     end
 
+    -- Re-apply hold immediately after tween (tweenTo unanchors on purpose)
+    holdAboveTarget(root)
     State.Status.CurrentAction = "attacking"
-    local clicks = State.FastAttack and 24 or 10
+
+    local clicks = State.FastAttack and 30 or 12
     for _ = 1, clicks do
         if gen ~= FarmRuntime.generation or State.BasicFarm ~= modeName then break end
         if State.FarmPaused then break end
         if not mob.Parent or not root.Parent or hum.Health <= 0 then break end
 
-        holdAboveTarget(root)
-        doFarmAttack()
+        -- Stay locked above the NPC every tick
+        if not holdAboveTarget(root) then break end
+        expandMobHitbox(mob)
+        tool = tool or equipBestTool()
+        doFarmAttack(tool, mob)
         attackWait()
     end
     releaseFarmHold()
+    State.Status.CurrentAction = "idle"
 end
 
 local function setNoCollide(model, state)
@@ -2118,6 +2284,8 @@ local function farmBones()
 
     local mob = findNearestEnemy(isBoneMob)
     if not mob then
+        State.Status.CurrentAction = "searching"
+        State.Status.CurrentTarget = "-"
         local char, hrp = getCharacter()
         if hrp and (hrp.Position - Vector3.new(-9500, 150, 5800)).Magnitude > 400 then
             tweenTo(CFrame.new(-9508, 142, 5737), nil, gen)
@@ -2125,64 +2293,20 @@ local function farmBones()
         return
     end
 
-    local root = mob:FindFirstChild("HumanoidRootPart")
-    local hum  = mob:FindFirstChildOfClass("Humanoid")
-    if not root or not hum or hum.Health <= 0 then return end
-
-    equipBestTool()
-    setNoCollide(mob, true)
-    pcall(function()
-        root.Size = Vector3.new(40, 40, 40)
-        root.Transparency = 1
-        root.CanCollide = false
-        hum.WalkSpeed = 0
-        hum.JumpPower = 0
-    end)
-
-    State.Status.CurrentTarget = mob.Name
-    State.Status.CurrentAction = "attacking"
-    if not tweenTo(root.CFrame * CFrame.new(0, 25, 0), nil, gen) then return end
-    for _ = 1, 8 do
-        if gen ~= FarmRuntime.generation or State.BasicFarm ~= "Bones" then break end
-        if State.FarmPaused then break end
-        if not mob.Parent or hum.Health <= 0 then break end
-        attackOnce()
-        attackWait()
-    end
+    farmCombatOnTarget(mob, gen, "Bones")
 end
 
 local function farmNearest()
     local gen = FarmRuntime.generation
-    if State.BasicFarm ~= "Nearest" and State.BasicFarm ~= "Levels" then return end
+    local modeName = State.BasicFarm
+    if modeName ~= "Nearest" and modeName ~= "Levels" then return end
     local mob = findNearestEnemy(nil)
     if not mob then
         State.Status.CurrentTarget = "-"
         State.Status.CurrentAction = "searching"
         return
     end
-    local root = mob:FindFirstChild("HumanoidRootPart")
-    local hum  = mob:FindFirstChildOfClass("Humanoid")
-    if not root or not hum or hum.Health <= 0 then return end
-
-    equipBestTool()
-    setNoCollide(mob, true)
-    pcall(function()
-        root.Size = Vector3.new(35, 35, 35)
-        root.Transparency = 1
-        root.CanCollide = false
-    end)
-
-    State.Status.CurrentTarget = mob.Name
-    State.Status.CurrentAction = "attacking"
-    if not tweenTo(root.CFrame * CFrame.new(0, 20, 0), nil, gen) then return end
-    for _ = 1, 6 do
-        if gen ~= FarmRuntime.generation then break end
-        if State.BasicFarm ~= "Nearest" and State.BasicFarm ~= "Levels" then break end
-        if State.FarmPaused then break end
-        if not mob.Parent or hum.Health <= 0 then break end
-        attackOnce()
-        attackWait()
-    end
+    farmCombatOnTarget(mob, gen, modeName)
 end
 
 local function farmCake()
@@ -2197,6 +2321,7 @@ local function farmCake()
 
     local prince = findCakePrince()
     if not prince then
+        State.Status.CurrentAction = "searching"
         local char, hrp = getCharacter()
         if hrp and (hrp.Position - Vector3.new(-2100, 70, -12000)).Magnitude > 500 then
             tweenTo(CFrame.new(-2092, 70, -12160), nil, gen)
@@ -2204,31 +2329,7 @@ local function farmCake()
         return
     end
 
-    local root = prince:FindFirstChild("HumanoidRootPart")
-    local hum  = prince:FindFirstChildOfClass("Humanoid")
-    if not root then return end
-    if hum and hum.Health <= 0 then return end
-
-    equipBestTool()
-    setNoCollide(prince, true)
-    pcall(function()
-        root.Size = Vector3.new(50, 50, 50)
-        root.Transparency = 1
-        root.CanCollide = false
-        if hum then hum.WalkSpeed = 0 end
-    end)
-
-    State.Status.CurrentTarget = prince.Name
-    State.Status.CurrentAction = "attacking"
-    if not tweenTo(root.CFrame * CFrame.new(0, 30, 0), nil, gen) then return end
-    for _ = 1, 10 do
-        if gen ~= FarmRuntime.generation or State.BasicFarm ~= "Cake" then break end
-        if State.FarmPaused then break end
-        if not prince.Parent then break end
-        if hum and hum.Health <= 0 then break end
-        attackOnce()
-        attackWait()
-    end
+    farmCombatOnTarget(prince, gen, "Cake")
 end
 
 local function farmLevels()
