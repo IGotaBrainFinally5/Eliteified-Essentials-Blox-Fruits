@@ -1424,7 +1424,7 @@ local function stageFarming()
     local farmToggles = FarmUI.modeToggles
     local bonesOptionRows = FarmUI.bonesOptionRows
 
-    -- EE v1.4 stability: ONLY function allowed to change BasicFarm from UI
+    -- EE v1.4 recovery: sole UI writer for BasicFarm (sync, logged, cancels movement)
     local function setFarmMode(newMode, reason)
         local prev = State.BasicFarm
         if newMode ~= nil and newMode ~= "Bones" and newMode ~= "Cake"
@@ -1432,12 +1432,12 @@ local function stageFarming()
             log("WARN", "setFarmMode rejected invalid mode: " .. tostring(newMode))
             return
         end
-        if prev == newMode then
-            -- still refresh UI visibility
-        else
+        if prev ~= newMode then
             State.BasicFarm = newMode
             FarmRuntime.generation = FarmRuntime.generation + 1
-            cancelFarmTween()
+            pcall(function()
+                if type(cancelFarmTween) == "function" then cancelFarmTween() end
+            end)
             log("INFO", string.format(
                 "Mode change: %s -> %s (reason: %s, gen=%d)",
                 tostring(prev or "none"), tostring(newMode or "none"),
@@ -1450,7 +1450,7 @@ local function stageFarming()
             State.Status.CurrentTarget = "-"
         end
 
-        -- Sync toggle visuals WITHOUT invoking callbacks (silent Set)
+        -- Sync mode toggle visuals only (silent = no callbacks)
         for _, name in ipairs(FARM_OPTIONS) do
             local toggle = farmToggles[name]
             if toggle then
@@ -1461,7 +1461,7 @@ local function stageFarming()
             end
         end
 
-        -- Bones sub-options: visible only when Bones is the active mode
+        -- Bones options: visible only when Bones is active (visibility only — no callbacks)
         local showBonesOpts = (State.BasicFarm == "Bones")
         for _, row in pairs(bonesOptionRows) do
             if row and row.Instance then
@@ -1480,69 +1480,53 @@ local function stageFarming()
     end
     FarmUI.setFarmMode = setFarmMode
 
-    for _, name in ipairs(FARM_OPTIONS) do
+    local function makeModeToggle(name)
         farmToggles[name] = Farming:AddToggle({
             Name = name,
             Default = false,
-            SyncCallback = true, -- critical: no task.spawn race
+            SyncCallback = true,
             Callback = function(on)
-                -- Click handler: derive desired mode from THIS toggle only
                 if on then
                     setFarmMode(name, "user toggle ON " .. name)
+                elseif State.BasicFarm == name then
+                    setFarmMode(nil, "user toggle OFF " .. name)
                 else
-                    -- only clear if this mode was the active one
-                    if State.BasicFarm == name then
-                        setFarmMode(nil, "user toggle OFF " .. name)
-                    else
-                        -- desync visual: force this toggle off without touching BasicFarm
-                        if farmToggles[name] then farmToggles[name]:Set(false, true) end
-                    end
+                    if farmToggles[name] then farmToggles[name]:Set(false, true) end
                 end
             end,
         })
+        return farmToggles[name]
     end
 
-    -- Bones options directly under Bones (hidden unless Bones mode active)
-    local b1 = CreateToggle(Farming.Page, {
-        Name = "Auto Random Surprise",
-        Description = "Death King - 50 Bones per roll",
-        Default = false,
-        Callback = function(on)
-            State.AutoRandomSurprise = on
-            log("INFO", "Auto Random Surprise: " .. tostring(on))
-        end,
-    })
-    local b2 = CreateToggle(Farming.Page, {
-        Name = "Auto Try Luck",
-        Description = "Gravestone - Try Your Luck (night)",
-        Default = false,
-        Callback = function(on)
-            State.AutoTryLuck = on
-            log("INFO", "Auto Try Luck: " .. tostring(on))
-        end,
-    })
-    local b3 = CreateToggle(Farming.Page, {
-        Name = "Auto Pray",
-        Description = "Gravestone - Pray (night)",
-        Default = false,
-        Callback = function(on)
-            State.AutoPray = on
-            log("INFO", "Auto Pray: " .. tostring(on))
-        end,
-    })
-    bonesOptionRows.Random = b1
-    bonesOptionRows.TryLuck = b2
-    bonesOptionRows.Pray = b3
-    -- place layout after mode toggles
-    pcall(function()
-        local base = 0
-        if farmToggles.Levels and farmToggles.Levels.Instance then
-            base = farmToggles.Levels.Instance.LayoutOrder
+    -- Layout: Bones -> three Bones options -> Cake -> Nearest -> Levels
+    makeModeToggle("Bones")
+
+    -- Restored Bones submenu (regression fix): always created, shown only when Bones is ON
+    local function makeBonesOption(name, desc, stateKey)
+        local tog = Farming:AddToggle({
+            Name = name,
+            Description = desc,
+            Default = false,
+            Callback = function(on)
+                State[stateKey] = on
+                log("INFO", name .. ": " .. tostring(on))
+            end,
+        })
+        if tog and tog.Instance then
+            tog.Instance.Visible = false -- hidden until Bones is enabled
         end
-        if b1.Instance then b1.Instance.LayoutOrder = base + 1; b1.Instance.Visible = false end
-        if b2.Instance then b2.Instance.LayoutOrder = base + 2; b2.Instance.Visible = false end
-        if b3.Instance then b3.Instance.LayoutOrder = base + 3; b3.Instance.Visible = false end
-    end)
+        return tog
+    end
+    bonesOptionRows.Random = makeBonesOption(
+        "Auto Random Surprise", "Death King - 50 Bones per roll", "AutoRandomSurprise")
+    bonesOptionRows.TryLuck = makeBonesOption(
+        "Auto Try Luck", "Gravestone - Try Your Luck (night)", "AutoTryLuck")
+    bonesOptionRows.Pray = makeBonesOption(
+        "Auto Pray", "Gravestone - Pray (night)", "AutoPray")
+
+    makeModeToggle("Cake")
+    makeModeToggle("Nearest")
+    makeModeToggle("Levels")
 
     ----------------------------------------------------------------
     -- EE v1.4 ADDITION: Diagnostics + controls
@@ -1743,14 +1727,23 @@ end
 local function tweenTo(cf, speed, gen)
     local char, hrp = getCharacter()
     if not char or not hrp then return false end
-    -- Single source of truth for speed (ignore stale hardcoded callers)
-    speed = State.TweenSpeed or 250
+    -- Only State.TweenSpeed controls farm movement (50-300). No island-travel system exists in this script.
+    speed = tonumber(State.TweenSpeed) or 250
     if speed < 50 then speed = 50 end
     if speed > 300 then speed = 300 end
     cancelFarmTween()
     if gen and gen ~= FarmRuntime.generation then return false end
+
     local dist = (hrp.Position - cf.Position).Magnitude
-    local t = math.max(0.15, math.min(4, dist / speed))
+    -- Cap duration so extreme distances cannot produce multi-second stacked motion
+    local t = dist / speed
+    if t < 0.12 then t = 0.12 end
+    if t > 3.5 then t = 3.5 end
+
+    -- Anchor during tween so physics does not fight the CFrame tween (reduces fling)
+    local wasAnchored = hrp.Anchored
+    pcall(function() hrp.Anchored = true end)
+
     local tw = TweenService:Create(hrp, TweenInfo.new(t, Enum.EasingStyle.Linear), { CFrame = cf })
     FarmRuntime.activeTween = tw
     tw:Play()
@@ -1758,6 +1751,8 @@ local function tweenTo(cf, speed, gen)
     if FarmRuntime.activeTween == tw then
         FarmRuntime.activeTween = nil
     end
+    pcall(function() hrp.Anchored = wasAnchored end)
+
     if gen and gen ~= FarmRuntime.generation then return false end
     return true
 end
