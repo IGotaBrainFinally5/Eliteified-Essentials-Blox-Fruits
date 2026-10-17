@@ -1,16 +1,17 @@
 --[[
-    Eliteified Essentials (BLOX FRUITS) - v1.3
+    Eliteified Essentials (BLOX FRUITS) - v1.4
     UI Framework + Gameplay Automation
 
-    v1.3: Real farming loops for Bones / Cake / Nearest / Levels
-          Bones Options: Auto Random Surprise, Auto Try Luck, Auto Pray
-          All loops stop cleanly when mode is turned off.
+    v1.3: Farming loops for Bones / Cake / Nearest / Levels + Bones Options
+    v1.4: Combat Settings UI, Bring Enemies config UI (no forced pull),
+          Bones expandable section, mode-sync guard, Farming diagnostics,
+          Clear Log / Stop All, pause + simple settings save.
 
     Diagnostics: bottom-left panel + [EE] console lines.
     If nothing prints, the paste was truncated - re-copy the entire file.
 ]]
 
-print("[EE] Script started - Eliteified Essentials v1.3")
+print("[EE] Script started - Eliteified Essentials v1.4")
 
 ----------------------------------------------------------------
 -- 1. CONFIG
@@ -81,12 +82,36 @@ local State = {
     AutoRandomSurprise = false,
     AutoTryLuck        = false,
     AutoPray           = false,
+    -- EE v1.4 ADDITION: combat / bring / status (UI + state)
+    CombatMode         = "Melee",       -- Melee | Blox Fruits | Sword | Gun
+    AttackDelayMs      = 0.12,          -- EE v1.4: UI range 0.0-5.0 (labeled ms); loops clamp safely
+    TweenSpeed         = 250,           -- 50-300
+    BringEnabled       = false,         -- UI config only; no forced NPC pull in v1.4
+    BringRange         = 100,           -- 25-500 studs
+    BringMaxTargets    = 5,             -- number 2-10, or math.huge for All
+    FarmPaused         = false,
+    Status = {
+        ActiveMode      = "none",
+        CurrentTarget   = "-",
+        CurrentAction   = "idle",
+        LastError       = "-",
+        BringStatus     = "disabled",
+        EnemiesSelected = 0,
+    },
 }
 local Connections = {}
 local Animators   = {}
 local Window      = { Tabs = {}, Selected = nil, Minimized = false }
 local Notify      = function() end -- replaced once the GUI exists
 local FarmRuntime = { running = false, task = nil }
+-- EE v1.4 ADDITION: handles for Stop All / mode sync (filled in stageFarming)
+local FarmUI = {
+    modeToggles = {},
+    syncing     = false,
+    bonesExpanded = false,
+    bonesPanel  = nil,
+    statusLabels = {},
+}
 
 local function connect(signal, fn)
     local c = signal:Connect(fn)
@@ -422,6 +447,186 @@ local function CreateToggle(parent, opts)
     connect(row.MouseLeave, function() tween(row, 0.15, { BackgroundColor3 = T.Surface }) end)
 
     render(true)
+    return object
+end
+
+-- EE v1.4 ADDITION: simple value slider (drag on track)
+local function clampNum(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+local function CreateSlider(parent, opts)
+    opts = opts or {}
+    local minV = opts.Min or 0
+    local maxV = opts.Max or 1
+    local step = opts.Step or 0.01
+    local value = opts.Default
+    if value == nil then value = minV end
+    value = clampNum(value, minV, maxV)
+
+    local row = new("Frame", {
+        Name = opts.Name or "Slider", BackgroundColor3 = T.Surface,
+        Size = UDim2.new(1, 0, 0, 56), LayoutOrder = opts.LayoutOrder or 0, Parent = parent,
+    }, { corner(10), stroke(T.Stroke, 1, 0.45) })
+
+    new("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 6),
+        Size = UDim2.new(1, -100, 0, 18), Font = Enum.Font.GothamMedium, TextSize = 13,
+        TextColor3 = T.Text, TextXAlignment = Enum.TextXAlignment.Left,
+        Text = opts.Name or "Slider", Parent = row,
+    })
+    local valueLabel = new("TextLabel", {
+        BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -14, 0, 6), Size = UDim2.fromOffset(80, 18),
+        Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = T.PurpleSoft,
+        TextXAlignment = Enum.TextXAlignment.Right, Text = "", Parent = row,
+    })
+    if opts.Description then
+        new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 24),
+            Size = UDim2.new(1, -28, 0, 12), Font = Enum.Font.Gotham, TextSize = 10,
+            TextColor3 = T.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
+            Text = opts.Description, Parent = row,
+        })
+    end
+
+    local track = new("Frame", {
+        BackgroundColor3 = T.ToggleOff, BorderSizePixel = 0,
+        Position = UDim2.new(0, 14, 1, -14), Size = UDim2.new(1, -28, 0, 6), Parent = row,
+    }, { round() })
+    local fill = new("Frame", {
+        BackgroundColor3 = T.Purple, BorderSizePixel = 0,
+        Size = UDim2.new(0, 0, 1, 0), Parent = track,
+    }, { round() })
+    local knob = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0.5, 0),
+        Size = UDim2.fromOffset(14, 14), BackgroundColor3 = T.Text, BorderSizePixel = 0, Parent = track,
+    }, { round() })
+
+    local object = { Instance = row }
+
+    local function formatValue(v)
+        if opts.Format then return opts.Format(v) end
+        if step >= 1 then return tostring(math.floor(v + 0.5)) end
+        return string.format("%.2f", v)
+    end
+
+    local function apply(v, silent)
+        v = clampNum(v, minV, maxV)
+        if step >= 1 then
+            v = math.floor(v / step + 0.5) * step
+        else
+            v = math.floor(v / step + 0.5) * step
+        end
+        v = clampNum(v, minV, maxV)
+        value = v
+        local alpha = (maxV > minV) and ((v - minV) / (maxV - minV)) or 0
+        fill.Size = UDim2.new(alpha, 0, 1, 0)
+        knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+        valueLabel.Text = formatValue(v)
+        if not silent and opts.Callback then task.spawn(opts.Callback, v) end
+    end
+
+    function object:Set(v, silent) apply(v, silent) end
+    function object:Get() return value end
+
+    local dragging = false
+    local function valueFromX(x)
+        local abs = track.AbsolutePosition.X
+        local w = track.AbsoluteSize.X
+        if w <= 0 then return value end
+        local a = clampNum((x - abs) / w, 0, 1)
+        return minV + a * (maxV - minV)
+    end
+
+    connect(track.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            apply(valueFromX(input.Position.X), false)
+        end
+    end)
+    connect(knob.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+        end
+    end)
+    connect(UserInputService.InputChanged, function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            apply(valueFromX(input.Position.X), false)
+        end
+    end)
+    connect(UserInputService.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    apply(value, true)
+    return object
+end
+
+-- EE v1.4 ADDITION: cycle button through a list of options
+local function CreateCycle(parent, opts)
+    opts = opts or {}
+    local options = opts.Options or { "A", "B" }
+    local index = 1
+    for i, o in ipairs(options) do
+        if o == opts.Default then index = i break end
+    end
+
+    local row = new("TextButton", {
+        Name = opts.Name or "Cycle", Text = "", AutoButtonColor = false,
+        BackgroundColor3 = T.Surface, Size = UDim2.new(1, 0, 0, opts.Description and 52 or 44),
+        LayoutOrder = opts.LayoutOrder or 0, Parent = parent,
+    }, { corner(10), stroke(T.Stroke, 1, 0.45) })
+
+    new("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.new(0, 14, 0, opts.Description and 8 or 0),
+        Size = UDim2.new(1, -120, 0, opts.Description and 18 or 44), Font = Enum.Font.GothamMedium,
+        TextSize = 14, TextColor3 = T.Text, TextXAlignment = Enum.TextXAlignment.Left,
+        Text = opts.Name or "Option", Parent = row,
+    })
+    if opts.Description then
+        new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 27),
+            Size = UDim2.new(1, -120, 0, 16), Font = Enum.Font.Gotham, TextSize = 11,
+            TextColor3 = T.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
+            Text = opts.Description, Parent = row,
+        })
+    end
+    local valLabel = new("TextLabel", {
+        BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -14, 0.5, 0), Size = UDim2.fromOffset(100, 20),
+        Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = T.BlueSoft,
+        TextXAlignment = Enum.TextXAlignment.Right, Text = tostring(options[index]), Parent = row,
+    })
+
+    local object = { Instance = row }
+    function object:Get() return options[index] end
+    function object:Set(v, silent)
+        for i, o in ipairs(options) do
+            if tostring(o) == tostring(v) then
+                index = i
+                valLabel.Text = tostring(options[index])
+                if not silent and opts.Callback then task.spawn(opts.Callback, options[index]) end
+                return
+            end
+        end
+    end
+
+    connect(row.MouseButton1Click, function()
+        index = (index % #options) + 1
+        valLabel.Text = tostring(options[index])
+        if opts.Callback then task.spawn(opts.Callback, options[index]) end
+    end)
+    connect(row.MouseEnter, function() tween(row, 0.15, { BackgroundColor3 = T.SurfaceHover }) end)
+    connect(row.MouseLeave, function() tween(row, 0.15, { BackgroundColor3 = T.Surface }) end)
     return object
 end
 
@@ -945,6 +1150,19 @@ local function stageWindow()
             return CreateBrandButton(tab.Page, o)
         end
 
+        -- EE v1.4 ADDITION
+        function tab:AddSlider(o)
+            o = o or {}
+            o.LayoutOrder = nextOrder()
+            return CreateSlider(tab.Page, o)
+        end
+
+        function tab:AddCycle(o)
+            o = o or {}
+            o.LayoutOrder = nextOrder()
+            return CreateCycle(tab.Page, o)
+        end
+
         connect(tab.Button.MouseButton1Click, function() Window:SelectTab(tab) end)
         connect(tab.Button.MouseEnter, function()
             if Window.Selected ~= tab then tween(tab.Button, 0.15, { BackgroundTransparency = 0.92 }) end
@@ -1056,21 +1274,143 @@ local function stageHome()
     end)
 end
 
--- Stage 6b: Farming tab + Bones Options --------------------------------
+-- Stage 6b: Farming tab (EE v1.4 layout) --------------------------------
 local function stageFarming()
     local Farming = Window:AddTab({ Name = "Farming", Icon = Icons.Farming })
 
+    ----------------------------------------------------------------
+    -- EE v1.4 ADDITION: Combat Settings (top of tab)
+    ----------------------------------------------------------------
+    Farming:AddSection("Combat Settings")
+
+    Farming:AddCycle({
+        Name = "Selected Mode",
+        Description = "Preferred loadout label (UI preference)",
+        Options = { "Melee", "Blox Fruits", "Sword", "Gun" },
+        Default = State.CombatMode,
+        Callback = function(v)
+            State.CombatMode = v
+            log("INFO", "Combat mode: " .. tostring(v))
+        end,
+    })
+
+    Farming:AddSlider({
+        Name = "Attack Delay",
+        Description = "UI scale 0.0-5.0 (ms label). Loops clamp to a safe wait.",
+        Min = 0, Max = 5, Step = 0.01, Default = State.AttackDelayMs,
+        Format = function(v) return string.format("%.2f ms", v) end,
+        Callback = function(v)
+            State.AttackDelayMs = v
+            log("INFO", "Attack delay UI value: " .. string.format("%.2f", v))
+        end,
+    })
+
+    Farming:AddSlider({
+        Name = "Tween Speed",
+        Description = "Movement speed used by farm tweens (50-300)",
+        Min = 50, Max = 300, Step = 1, Default = State.TweenSpeed,
+        Format = function(v) return tostring(math.floor(v + 0.5)) end,
+        Callback = function(v)
+            State.TweenSpeed = v
+            log("INFO", "Tween speed: " .. tostring(math.floor(v + 0.5)))
+        end,
+    })
+
+    ----------------------------------------------------------------
+    -- EE v1.4 ADDITION: Bring Enemies (config UI only)
+    ----------------------------------------------------------------
+    Farming:AddSection("Bring Enemies")
+
+    local bringStatusLabel
+    local function refreshBringStatus()
+        if State.BringEnabled then
+            local maxTxt = (State.BringMaxTargets == math.huge) and "All" or tostring(State.BringMaxTargets)
+            State.Status.BringStatus = string.format("configured %dstud max=%s (UI only)", State.BringRange, maxTxt)
+        else
+            State.Status.BringStatus = "disabled"
+        end
+        State.Status.EnemiesSelected = 0 -- no live pull; counter stays 0 unless updated elsewhere
+        if bringStatusLabel then
+            bringStatusLabel.Text = "Status: " .. State.Status.BringStatus
+                .. "  |  Selected: " .. tostring(State.Status.EnemiesSelected)
+        end
+    end
+
+    Farming:AddToggle({
+        Name = "Enable Bring Enemies",
+        Description = "Config only in v1.4 — does not force NPC movement",
+        Default = false,
+        Callback = function(on)
+            State.BringEnabled = on
+            refreshBringStatus()
+            log("INFO", "Bring Enemies config: " .. tostring(on))
+        end,
+    })
+
+    Farming:AddSlider({
+        Name = "Bring Range",
+        Description = "Configured range in studs (25-500)",
+        Min = 25, Max = 500, Step = 1, Default = State.BringRange,
+        Format = function(v) return tostring(math.floor(v + 0.5)) .. " studs" end,
+        Callback = function(v)
+            State.BringRange = v
+            refreshBringStatus()
+        end,
+    })
+
+    Farming:AddCycle({
+        Name = "Max Targets",
+        Description = "Configured max target count",
+        Options = { "2", "3", "4", "5", "6", "7", "8", "9", "10", "All" },
+        Default = "5",
+        Callback = function(v)
+            if v == "All" then
+                State.BringMaxTargets = math.huge
+            else
+                State.BringMaxTargets = tonumber(v) or 5
+            end
+            refreshBringStatus()
+        end,
+    })
+
+    bringStatusLabel = new("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28),
+        LayoutOrder = 0, Font = Enum.Font.Gotham, TextSize = 11,
+        TextColor3 = T.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
+        TextWrapped = true, Text = "Status: disabled  |  Selected: 0", Parent = Farming.Page,
+    })
+    -- fix layout order via page's next order: re-parent after section items by setting LayoutOrder high enough
+    pcall(function()
+        local n = 0
+        for _, ch in ipairs(Farming.Page:GetChildren()) do
+            if ch:IsA("GuiObject") and typeof(ch.LayoutOrder) == "number" then
+                n = math.max(n, ch.LayoutOrder)
+            end
+        end
+        bringStatusLabel.LayoutOrder = n + 1
+    end)
+    refreshBringStatus()
+
+    ----------------------------------------------------------------
+    -- Basic Farms (mutually exclusive) + mode sync guard
+    ----------------------------------------------------------------
     Farming:AddSection("Basic Farms")
 
     local FARM_OPTIONS = { "Bones", "Cake", "Nearest", "Levels" }
-    local farmToggles = {}
+    local farmToggles = FarmUI.modeToggles
 
     local function syncFarmToggles()
+        FarmUI.syncing = true
         for name, toggle in pairs(farmToggles) do
             local shouldBeOn = (State.BasicFarm == name)
             if toggle:Get() ~= shouldBeOn then
-                toggle:Set(shouldBeOn, true)
+                toggle:Set(shouldBeOn, true) -- silent
             end
+        end
+        FarmUI.syncing = false
+        State.Status.ActiveMode = State.BasicFarm or "none"
+        if FarmUI.statusLabels.ActiveMode then
+            FarmUI.statusLabels.ActiveMode.Text = "Active Mode: " .. State.Status.ActiveMode
         end
     end
 
@@ -1079,10 +1419,15 @@ local function stageFarming()
             Name = name,
             Default = false,
             Callback = function(on)
+                if FarmUI.syncing then return end -- EE v1.4: re-entrancy guard
                 if on then
                     State.BasicFarm = name
                 elseif State.BasicFarm == name then
                     State.BasicFarm = nil
+                end
+                -- never leave BasicFarm pointing at a different mode than the click target
+                if on and State.BasicFarm ~= name then
+                    State.BasicFarm = name
                 end
                 syncFarmToggles()
                 log("INFO", "Basic Farm: " .. tostring(State.BasicFarm or "none"))
@@ -1095,37 +1440,265 @@ local function stageFarming()
         })
     end
 
-    Farming:AddSection("Bones Options")
+    ----------------------------------------------------------------
+    -- EE v1.4 ADDITION: Bones expandable section under Bones
+    ----------------------------------------------------------------
+    Farming:AddSection("Bones Settings")
 
-    Farming:AddToggle({
+    local bonesExpandBtn = new("TextButton", {
+        Name = "BonesExpand", Text = "", AutoButtonColor = false,
+        BackgroundColor3 = T.Surface, Size = UDim2.new(1, 0, 0, 36),
+        Parent = Farming.Page,
+    }, { corner(10), stroke(T.Stroke, 1, 0.45) })
+    pcall(function()
+        local n = 0
+        for _, ch in ipairs(Farming.Page:GetChildren()) do
+            if ch:IsA("GuiObject") and typeof(ch.LayoutOrder) == "number" then
+                n = math.max(n, ch.LayoutOrder)
+            end
+        end
+        bonesExpandBtn.LayoutOrder = n + 1
+    end)
+
+    local bonesExpandLabel = new("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
+        Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = T.Text,
+        Text = "Bones Settings  [+]", Parent = bonesExpandBtn,
+    })
+
+    local bonesPanel = new("Frame", {
+        Name = "BonesPanel", BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 0), Visible = false, ClipsDescendants = true,
+        Parent = Farming.Page,
+    }, {
+        new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+    })
+    pcall(function()
+        bonesPanel.LayoutOrder = bonesExpandBtn.LayoutOrder + 1
+    end)
+    FarmUI.bonesPanel = bonesPanel
+
+    local function setBonesExpanded(open)
+        FarmUI.bonesExpanded = open
+        bonesPanel.Visible = open
+        if open then
+            bonesPanel.Size = UDim2.new(1, 0, 0, 180)
+            bonesExpandLabel.Text = "Bones Settings  [-]"
+        else
+            bonesPanel.Size = UDim2.new(1, 0, 0, 0)
+            bonesExpandLabel.Text = "Bones Settings  [+]"
+        end
+    end
+    setBonesExpanded(false)
+
+    connect(bonesExpandBtn.MouseButton1Click, function()
+        setBonesExpanded(not FarmUI.bonesExpanded)
+        -- expand/collapse only — does not change BasicFarm
+    end)
+    connect(bonesExpandBtn.MouseEnter, function()
+        tween(bonesExpandBtn, 0.15, { BackgroundColor3 = T.SurfaceHover })
+    end)
+    connect(bonesExpandBtn.MouseLeave, function()
+        tween(bonesExpandBtn, 0.15, { BackgroundColor3 = T.Surface })
+    end)
+
+    CreateToggle(bonesPanel, {
         Name = "Auto Random Surprise",
         Description = "Death King - 50 Bones per roll",
         Default = false,
+        LayoutOrder = 1,
         Callback = function(on)
             State.AutoRandomSurprise = on
             log("INFO", "Auto Random Surprise: " .. tostring(on))
         end,
     })
-
-    Farming:AddToggle({
+    CreateToggle(bonesPanel, {
         Name = "Auto Try Luck",
         Description = "Gravestone - Try Your Luck (night)",
         Default = false,
+        LayoutOrder = 2,
         Callback = function(on)
             State.AutoTryLuck = on
             log("INFO", "Auto Try Luck: " .. tostring(on))
         end,
     })
-
-    Farming:AddToggle({
+    CreateToggle(bonesPanel, {
         Name = "Auto Pray",
         Description = "Gravestone - Pray (night)",
         Default = false,
+        LayoutOrder = 3,
         Callback = function(on)
             State.AutoPray = on
             log("INFO", "Auto Pray: " .. tostring(on))
         end,
     })
+    new("TextLabel", {
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 18), LayoutOrder = 4,
+        Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = T.TextDim,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "Bones Status: options keep state when collapsed",
+        Parent = bonesPanel,
+    })
+
+    ----------------------------------------------------------------
+    -- EE v1.4 ADDITION: Diagnostics + controls
+    ----------------------------------------------------------------
+    Farming:AddSection("Diagnostics")
+
+    local function addStatusLine(key, initial)
+        local lbl = new("TextLabel", {
+            BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16),
+            Font = Enum.Font.Code, TextSize = 11, TextColor3 = T.TextDim,
+            TextXAlignment = Enum.TextXAlignment.Left, Text = initial, Parent = Farming.Page,
+        })
+        pcall(function()
+            local n = 0
+            for _, ch in ipairs(Farming.Page:GetChildren()) do
+                if ch:IsA("GuiObject") and typeof(ch.LayoutOrder) == "number" then
+                    n = math.max(n, ch.LayoutOrder)
+                end
+            end
+            lbl.LayoutOrder = n + 1
+        end)
+        FarmUI.statusLabels[key] = lbl
+        return lbl
+    end
+
+    addStatusLine("ActiveMode", "Active Mode: none")
+    addStatusLine("CurrentTarget", "Current Target: -")
+    addStatusLine("CurrentAction", "Current Action: idle")
+    addStatusLine("LastError", "Last Error: -")
+    addStatusLine("BringStatus", "Bring Enemies: disabled")
+    addStatusLine("EnemiesSelected", "Enemies Selected: 0")
+
+    local function refreshStatusUI()
+        local S = State.Status
+        if FarmUI.statusLabels.ActiveMode then
+            FarmUI.statusLabels.ActiveMode.Text = "Active Mode: " .. tostring(S.ActiveMode)
+        end
+        if FarmUI.statusLabels.CurrentTarget then
+            FarmUI.statusLabels.CurrentTarget.Text = "Current Target: " .. tostring(S.CurrentTarget)
+        end
+        if FarmUI.statusLabels.CurrentAction then
+            FarmUI.statusLabels.CurrentAction.Text = "Current Action: " .. tostring(S.CurrentAction)
+        end
+        if FarmUI.statusLabels.LastError then
+            FarmUI.statusLabels.LastError.Text = "Last Error: " .. tostring(S.LastError)
+        end
+        if FarmUI.statusLabels.BringStatus then
+            FarmUI.statusLabels.BringStatus.Text = "Bring Enemies: " .. tostring(S.BringStatus)
+        end
+        if FarmUI.statusLabels.EnemiesSelected then
+            FarmUI.statusLabels.EnemiesSelected.Text = "Enemies Selected: " .. tostring(S.EnemiesSelected)
+        end
+    end
+    FarmUI.refreshStatusUI = refreshStatusUI
+
+    -- Pause toggle
+    Farming:AddToggle({
+        Name = "Pause Farming",
+        Description = "Pauses farm controller ticks without clearing mode",
+        Default = false,
+        Callback = function(on)
+            State.FarmPaused = on
+            State.Status.CurrentAction = on and "paused" or "idle"
+            if FarmUI.refreshStatusUI then FarmUI.refreshStatusUI() end
+            log("INFO", "Farm paused: " .. tostring(on))
+        end,
+    })
+
+    -- Clear Log button
+    local clearBtn = new("TextButton", {
+        Name = "ClearLog", Text = "Clear Log", AutoButtonColor = false,
+        BackgroundColor3 = T.Surface, Size = UDim2.new(1, 0, 0, 36),
+        Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = T.Text, Parent = Farming.Page,
+    }, { corner(10), stroke(T.Stroke, 1, 0.45) })
+    pcall(function()
+        local n = 0
+        for _, ch in ipairs(Farming.Page:GetChildren()) do
+            if ch:IsA("GuiObject") and typeof(ch.LayoutOrder) == "number" then
+                n = math.max(n, ch.LayoutOrder)
+            end
+        end
+        clearBtn.LayoutOrder = n + 1
+    end)
+    connect(clearBtn.MouseButton1Click, function()
+        Diag.Lines = {}
+        Diag.Failed = false
+        refreshDiag()
+        State.Status.LastError = "-"
+        if FarmUI.refreshStatusUI then FarmUI.refreshStatusUI() end
+        log("INFO", "Diagnostics log cleared")
+    end)
+
+    -- Stop All button
+    local stopBtn = new("TextButton", {
+        Name = "StopAll", Text = "Stop All", AutoButtonColor = false,
+        BackgroundColor3 = T.Surface, Size = UDim2.new(1, 0, 0, 36),
+        Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = T.Danger, Parent = Farming.Page,
+    }, { corner(10), stroke(T.Danger, 1, 0.5) })
+    pcall(function()
+        stopBtn.LayoutOrder = clearBtn.LayoutOrder + 1
+    end)
+    connect(stopBtn.MouseButton1Click, function()
+        State.BasicFarm = nil
+        State.AutoRandomSurprise = false
+        State.AutoTryLuck = false
+        State.AutoPray = false
+        State.FarmPaused = false
+        State.Status.ActiveMode = "none"
+        State.Status.CurrentTarget = "-"
+        State.Status.CurrentAction = "stopped"
+        State.Status.EnemiesSelected = 0
+        syncFarmToggles()
+        if FarmUI.refreshStatusUI then FarmUI.refreshStatusUI() end
+        log("OK", "Stop All: modes cleared, UI synced")
+        Notify("Farming", "All modes stopped", 3, T.Danger)
+    end)
+
+    -- Save settings (UI prefs only)
+    local saveBtn = new("TextButton", {
+        Name = "SaveSettings", Text = "Save Settings", AutoButtonColor = false,
+        BackgroundColor3 = T.Surface, Size = UDim2.new(1, 0, 0, 36),
+        Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = T.BlueSoft, Parent = Farming.Page,
+    }, { corner(10), stroke(T.Blue, 1, 0.5) })
+    pcall(function()
+        saveBtn.LayoutOrder = stopBtn.LayoutOrder + 1
+    end)
+    connect(saveBtn.MouseButton1Click, function()
+        local ok, err = pcall(function()
+            local env = getEnv()
+            env.EliteifiedEssentials_Settings = {
+                CombatMode = State.CombatMode,
+                AttackDelayMs = State.AttackDelayMs,
+                TweenSpeed = State.TweenSpeed,
+                BringEnabled = State.BringEnabled,
+                BringRange = State.BringRange,
+                BringMaxTargets = State.BringMaxTargets,
+            }
+        end)
+        if ok then
+            log("OK", "Settings saved to getgenv().EliteifiedEssentials_Settings")
+            Notify("Settings", "UI preferences saved", 3, T.Blue)
+        else
+            log("WARN", "Save settings failed: " .. tostring(err))
+        end
+    end)
+
+    -- Load saved settings if present
+    pcall(function()
+        local s = getEnv().EliteifiedEssentials_Settings
+        if type(s) == "table" then
+            if s.CombatMode then State.CombatMode = s.CombatMode end
+            if s.AttackDelayMs then State.AttackDelayMs = s.AttackDelayMs end
+            if s.TweenSpeed then State.TweenSpeed = s.TweenSpeed end
+            if s.BringEnabled ~= nil then State.BringEnabled = s.BringEnabled end
+            if s.BringRange then State.BringRange = s.BringRange end
+            if s.BringMaxTargets then State.BringMaxTargets = s.BringMaxTargets end
+            refreshBringStatus()
+            log("INFO", "Loaded saved UI settings")
+        end
+    end)
 end
 
 ----------------------------------------------------------------
@@ -1154,13 +1727,23 @@ end
 local function tweenTo(cf, speed)
     local char, hrp = getCharacter()
     if not char or not hrp then return false end
-    speed = speed or 250
+    -- EE v1.4: prefer State.TweenSpeed when caller omits speed
+    speed = speed or State.TweenSpeed or 250
     local dist = (hrp.Position - cf.Position).Magnitude
     local t = math.max(0.15, math.min(4, dist / speed))
     local tw = TweenService:Create(hrp, TweenInfo.new(t, Enum.EasingStyle.Linear), { CFrame = cf })
     tw:Play()
     tw.Completed:Wait()
     return true
+end
+
+-- EE v1.4 ADDITION: safe attack wait from UI delay value
+local function attackWait()
+    -- UI stores 0-5 labeled ms; clamp to a practical minimum so the client does not spin
+    local sec = tonumber(State.AttackDelayMs) or 0.12
+    if sec > 5 then sec = sec / 1000 end -- allow accidental whole-ms entry
+    sec = math.max(0.05, math.min(5, sec))
+    task.wait(sec)
 end
 
 local function equipBestTool()
@@ -1328,18 +1911,25 @@ local function farmBones()
         hum.JumpPower = 0
     end)
 
-    tweenTo(root.CFrame * CFrame.new(0, 25, 0), 320)
+    State.Status.CurrentTarget = mob.Name
+    State.Status.CurrentAction = "attacking"
+    tweenTo(root.CFrame * CFrame.new(0, 25, 0))
     for _ = 1, 8 do
         if not State.BasicFarm or State.BasicFarm ~= "Bones" then break end
+        if State.FarmPaused then break end
         if not mob.Parent or hum.Health <= 0 then break end
         attackOnce()
-        task.wait(0.12)
+        attackWait()
     end
 end
 
 local function farmNearest()
     local mob = findNearestEnemy(nil)
-    if not mob then return end
+    if not mob then
+        State.Status.CurrentTarget = "-"
+        State.Status.CurrentAction = "searching"
+        return
+    end
     local root = mob:FindFirstChild("HumanoidRootPart")
     local hum  = mob:FindFirstChildOfClass("Humanoid")
     if not root or not hum or hum.Health <= 0 then return end
@@ -1352,12 +1942,15 @@ local function farmNearest()
         root.CanCollide = false
     end)
 
-    tweenTo(root.CFrame * CFrame.new(0, 20, 0), 300)
+    State.Status.CurrentTarget = mob.Name
+    State.Status.CurrentAction = "attacking"
+    tweenTo(root.CFrame * CFrame.new(0, 20, 0))
     for _ = 1, 6 do
         if not State.BasicFarm or State.BasicFarm ~= "Nearest" then break end
+        if State.FarmPaused then break end
         if not mob.Parent or hum.Health <= 0 then break end
         attackOnce()
-        task.wait(0.12)
+        attackWait()
     end
 end
 
@@ -1392,13 +1985,16 @@ local function farmCake()
         if hum then hum.WalkSpeed = 0 end
     end)
 
-    tweenTo(root.CFrame * CFrame.new(0, 30, 0), 300)
+    State.Status.CurrentTarget = prince.Name
+    State.Status.CurrentAction = "attacking"
+    tweenTo(root.CFrame * CFrame.new(0, 30, 0))
     for _ = 1, 10 do
         if not State.BasicFarm or State.BasicFarm ~= "Cake" then break end
+        if State.FarmPaused then break end
         if not prince.Parent then break end
         if hum and hum.Health <= 0 then break end
         attackOnce()
-        task.wait(0.1)
+        attackWait()
     end
 end
 
@@ -1420,28 +2016,40 @@ local function startFarmController()
     FarmRuntime.task = task.spawn(function()
         while FarmRuntime.running do
             local mode = State.BasicFarm
-            local ok, err = pcall(function()
-                if mode == "Bones" then
-                    farmBones()
-                elseif mode == "Cake" then
-                    farmCake()
-                elseif mode == "Nearest" then
-                    farmNearest()
-                elseif mode == "Levels" then
-                    farmLevels()
-                else
-                    if State.AutoRandomSurprise then doRandomSurprise() end
-                    if State.AutoTryLuck then doGravestone("TryLuck") end
-                    if State.AutoPray then doGravestone("Pray") end
-                end
-            end)
-            if not ok then
-                log("WARN", "Farm tick error: " .. tostring(err))
-            end
-            if mode then
-                task.wait(0.25)
+            State.Status.ActiveMode = mode or "none"
+
+            if State.FarmPaused then
+                State.Status.CurrentAction = "paused"
+                if FarmUI.refreshStatusUI then pcall(FarmUI.refreshStatusUI) end
+                task.wait(0.4)
             else
-                task.wait(1.0)
+                local ok, err = pcall(function()
+                    if mode == "Bones" then
+                        farmBones()
+                    elseif mode == "Cake" then
+                        farmCake()
+                    elseif mode == "Nearest" then
+                        farmNearest()
+                    elseif mode == "Levels" then
+                        farmLevels()
+                    else
+                        State.Status.CurrentAction = "idle"
+                        State.Status.CurrentTarget = "-"
+                        if State.AutoRandomSurprise then doRandomSurprise() end
+                        if State.AutoTryLuck then doGravestone("TryLuck") end
+                        if State.AutoPray then doGravestone("Pray") end
+                    end
+                end)
+                if not ok then
+                    State.Status.LastError = tostring(err):match("^[^\n]*") or tostring(err)
+                    log("WARN", "Farm tick error: " .. tostring(err))
+                end
+                if FarmUI.refreshStatusUI then pcall(FarmUI.refreshStatusUI) end
+                if mode then
+                    task.wait(0.25)
+                else
+                    task.wait(1.0)
+                end
             end
         end
         log("INFO", "Farm controller stopped")
@@ -1506,5 +2114,5 @@ for _, s in ipairs(stages) do
     end
 end
 
-log("OK", "Eliteified Essentials v1.3 loaded (UI + gameplay)")
+log("OK", "Eliteified Essentials v1.4 loaded (UI + gameplay)")
 finishDiag(true)
