@@ -430,10 +430,14 @@ local function CreateToggle(parent, opts)
     opts = opts or {}
     local state = opts.Default == true
     local hasDesc = opts.Description ~= nil
+    -- Optional darker row when ON (e.g. Bones). Off stays normal Surface.
+    local offBg = T.Surface
+    local onBg = opts.ActiveSurfaceColor or T.Surface
+    local hoverBg = T.SurfaceHover
 
     local row = new("TextButton", {
         Name = opts.Name or "Toggle", Text = "", AutoButtonColor = false,
-        BackgroundColor3 = T.Surface, Size = UDim2.new(1, 0, 0, hasDesc and 52 or 44),
+        BackgroundColor3 = offBg, Size = UDim2.new(1, 0, 0, hasDesc and 52 or 44),
         LayoutOrder = opts.LayoutOrder or 0, Parent = parent,
     }, { corner(10), stroke(T.Stroke, 1, 0.45) })
 
@@ -471,6 +475,10 @@ local function CreateToggle(parent, opts)
 
     local object = { Instance = row }
 
+    local function rowBg()
+        return state and onBg or offBg
+    end
+
     local function render(instant)
         local d = instant and 0 or 0.22
         tween(track, d, { BackgroundColor3 = state and T.Purple or T.ToggleOff })
@@ -481,6 +489,7 @@ local function CreateToggle(parent, opts)
         }, Enum.EasingStyle.Back)
         stateLabel.Text = state and "ON" or "OFF"
         tween(stateLabel, d, { TextColor3 = state and T.PurpleSoft or T.TextDim })
+        tween(row, d, { BackgroundColor3 = rowBg() })
     end
 
     function object:Set(value, silent)
@@ -498,8 +507,12 @@ local function CreateToggle(parent, opts)
     function object:Get() return state end
 
     connect(row.MouseButton1Click, function() object:Set(not state) end)
-    connect(row.MouseEnter, function() tween(row, 0.15, { BackgroundColor3 = T.SurfaceHover }) end)
-    connect(row.MouseLeave, function() tween(row, 0.15, { BackgroundColor3 = T.Surface }) end)
+    connect(row.MouseEnter, function()
+        tween(row, 0.15, { BackgroundColor3 = hoverBg })
+    end)
+    connect(row.MouseLeave, function()
+        tween(row, 0.15, { BackgroundColor3 = rowBg() })
+    end)
 
     render(true)
     return object
@@ -682,6 +695,148 @@ local function CreateCycle(parent, opts)
     end)
     connect(row.MouseEnter, function() tween(row, 0.15, { BackgroundColor3 = T.SurfaceHover }) end)
     connect(row.MouseLeave, function() tween(row, 0.15, { BackgroundColor3 = T.Surface }) end)
+    return object
+end
+
+-- Compact right-aligned dropdown: label left, [ value  ▼ ] box right, list below when open
+local function CreateDropdown(parent, opts)
+    opts = opts or {}
+    local options = opts.Options or { "A", "B" }
+    local index = 1
+    for i, o in ipairs(options) do
+        if tostring(o) == tostring(opts.Default) then
+            index = i
+            break
+        end
+    end
+
+    local closedH = opts.Description and 52 or 44
+    local optionH = 28
+    local openH = closedH + (#options * optionH) + 6
+
+    local row = new("Frame", {
+        Name = opts.Name or "Dropdown",
+        BackgroundColor3 = T.Surface,
+        Size = UDim2.new(1, 0, 0, closedH),
+        LayoutOrder = opts.LayoutOrder or 0,
+        ClipsDescendants = true,
+        Parent = parent,
+    }, { corner(10), stroke(T.Stroke, 1, 0.45) })
+
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.new(0, 14, 0, opts.Description and 8 or 0),
+        Size = UDim2.new(1, -130, 0, opts.Description and 18 or closedH),
+        Font = Enum.Font.GothamMedium, TextSize = 14, TextColor3 = T.Text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Text = opts.Name or "Option", Parent = row,
+    })
+    if opts.Description then
+        new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 27),
+            Size = UDim2.new(1, -130, 0, 16), Font = Enum.Font.Gotham, TextSize = 11,
+            TextColor3 = T.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd, Text = opts.Description, Parent = row,
+        })
+    end
+
+    local box = new("TextButton", {
+        Name = "DropBox", Text = "", AutoButtonColor = false,
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -14, 0, opts.Description and 10 or 8),
+        Size = UDim2.fromOffset(118, 28),
+        BackgroundColor3 = T.Panel, Parent = row,
+    }, { corner(8), stroke(T.Stroke, 1, 0.35) })
+
+    local valLabel = new("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0),
+        Size = UDim2.new(1, -28, 1, 0), Font = Enum.Font.GothamBold, TextSize = 12,
+        TextColor3 = T.BlueSoft, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Text = tostring(options[index]), Parent = box,
+    })
+    new("TextLabel", {
+        BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -6, 0.5, 0), Size = UDim2.fromOffset(16, 16),
+        Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = T.TextDim,
+        Text = "▼", Parent = box,
+    })
+
+    local menu = new("Frame", {
+        Name = "Menu", BackgroundTransparency = 1, Visible = false,
+        Position = UDim2.new(1, -14, 0, closedH - 2),
+        AnchorPoint = Vector2.new(1, 0),
+        Size = UDim2.fromOffset(118, #options * optionH),
+        Parent = row,
+    }, {
+        new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 0) }),
+    })
+
+    local open = false
+    local object = { Instance = row }
+
+    local function setOpen(v)
+        open = v and true or false
+        menu.Visible = open
+        row.Size = UDim2.new(1, 0, 0, open and openH or closedH)
+        row.ZIndex = open and 20 or 1
+        box.ZIndex = open and 21 or 1
+        menu.ZIndex = open and 22 or 1
+    end
+
+    local function applyIndex(i, silent)
+        index = i
+        valLabel.Text = tostring(options[index])
+        setOpen(false)
+        if not silent and opts.Callback then
+            task.spawn(opts.Callback, options[index])
+        end
+    end
+
+    function object:Get()
+        return options[index]
+    end
+    function object:Set(v, silent)
+        for i, o in ipairs(options) do
+            if tostring(o) == tostring(v) then
+                applyIndex(i, silent)
+                return
+            end
+        end
+    end
+
+    for i, o in ipairs(options) do
+        local optBtn = new("TextButton", {
+            Name = "Opt_" .. tostring(o),
+            Text = tostring(o), AutoButtonColor = false,
+            BackgroundColor3 = T.Panel, Size = UDim2.new(1, 0, 0, optionH),
+            Font = Enum.Font.GothamMedium, TextSize = 12,
+            TextColor3 = T.Text, LayoutOrder = i, Parent = menu,
+        }, { corner(6) })
+        connect(optBtn.MouseEnter, function()
+            tween(optBtn, 0.12, { BackgroundColor3 = T.SurfaceHover })
+        end)
+        connect(optBtn.MouseLeave, function()
+            tween(optBtn, 0.12, { BackgroundColor3 = T.Panel })
+        end)
+        connect(optBtn.MouseButton1Click, function()
+            applyIndex(i, false)
+        end)
+    end
+
+    connect(box.MouseButton1Click, function()
+        setOpen(not open)
+    end)
+    connect(box.MouseEnter, function()
+        tween(box, 0.12, { BackgroundColor3 = T.SurfaceHover })
+    end)
+    connect(box.MouseLeave, function()
+        if not open then
+            tween(box, 0.12, { BackgroundColor3 = T.Panel })
+        end
+    end)
+
     return object
 end
 
@@ -1218,6 +1373,12 @@ local function stageWindow()
             return CreateCycle(tab.Page, o)
         end
 
+        function tab:AddDropdown(o)
+            o = o or {}
+            o.LayoutOrder = nextOrder()
+            return CreateDropdown(tab.Page, o)
+        end
+
         connect(tab.Button.MouseButton1Click, function() Window:SelectTab(tab) end)
         connect(tab.Button.MouseEnter, function()
             if Window.Selected ~= tab then tween(tab.Button, 0.15, { BackgroundTransparency = 0.92 }) end
@@ -1346,7 +1507,7 @@ local function stageFarming()
     ----------------------------------------------------------------
     Farming:AddSection("Combat Settings")
 
-    Farming:AddCycle({
+    local combatModeDropdown = Farming:AddDropdown({
         Name = "Selected Mode",
         Description = "Equips a matching tool from backpack when possible",
         Options = { "Melee", "Blox Fruits", "Sword", "Gun" },
@@ -1363,6 +1524,7 @@ local function stageFarming()
             if FarmUI.refreshStatusUI then pcall(FarmUI.refreshStatusUI) end
         end,
     })
+    FarmUI.combatModeDropdown = combatModeDropdown
 
     Farming:AddSlider({
         Name = "Attack Delay",
@@ -1449,11 +1611,17 @@ local function stageFarming()
         end,
     })
 
-    Farming:AddCycle({
+    local maxTargetsDefault = "5"
+    if State.BringMaxTargets == math.huge then
+        maxTargetsDefault = "All"
+    elseif State.BringMaxTargets then
+        maxTargetsDefault = tostring(State.BringMaxTargets)
+    end
+    local maxTargetsDropdown = Farming:AddDropdown({
         Name = "Max Targets",
         Description = "Configured max target count",
         Options = { "2", "3", "4", "5", "6", "7", "8", "9", "10", "All" },
-        Default = "5",
+        Default = maxTargetsDefault,
         Callback = function(v)
             if v == "All" then
                 State.BringMaxTargets = math.huge
@@ -1463,6 +1631,7 @@ local function stageFarming()
             refreshBringStatus()
         end,
     })
+    FarmUI.maxTargetsDropdown = maxTargetsDropdown
 
     bringStatusLabel = new("TextLabel", {
         BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28),
@@ -1548,7 +1717,7 @@ local function stageFarming()
     FarmUI.setFarmMode = setFarmMode
 
     local function makeModeToggle(name)
-        farmToggles[name] = Farming:AddToggle({
+        local togOpts = {
             Name = name,
             Default = false,
             SyncCallback = true,
@@ -1561,7 +1730,12 @@ local function stageFarming()
                     if farmToggles[name] then farmToggles[name]:Set(false, true) end
                 end
             end,
-        })
+        }
+        -- Bones only: darker surface when enabled (same size/position)
+        if name == "Bones" then
+            togOpts.ActiveSurfaceColor = Color3.fromRGB(12, 14, 22)
+        end
+        farmToggles[name] = Farming:AddToggle(togOpts)
         return farmToggles[name]
     end
 
@@ -1757,7 +1931,7 @@ local function stageFarming()
         end
     end)
 
-    -- Load saved settings if present
+    -- Load saved settings if present (update State + sync dropdown display, silent)
     pcall(function()
         local s = getEnv().EliteifiedEssentials_Settings
         if type(s) == "table" then
@@ -1767,6 +1941,15 @@ local function stageFarming()
             if s.BringEnabled ~= nil then State.BringEnabled = s.BringEnabled end
             if s.BringRange then State.BringRange = s.BringRange end
             if s.BringMaxTargets then State.BringMaxTargets = s.BringMaxTargets end
+            -- Reflect loaded values in dropdowns without re-firing callbacks
+            if FarmUI.combatModeDropdown and State.CombatMode then
+                FarmUI.combatModeDropdown:Set(State.CombatMode, true)
+            end
+            if FarmUI.maxTargetsDropdown then
+                local mt = State.BringMaxTargets
+                local label = (mt == math.huge) and "All" or tostring(mt or 5)
+                FarmUI.maxTargetsDropdown:Set(label, true)
+            end
             refreshBringStatus()
             log("INFO", "Loaded saved UI settings")
         end
