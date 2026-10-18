@@ -121,6 +121,7 @@ local FarmRuntime = {
     generation = 0,
     -- move: { tween, hrp, wasAnchored } — owned by the active tweenTo; cleared on finish/cancel
     move = nil,
+    charHooksConnected = false, -- prevents duplicate CharacterRemoving/Added connections
 }
 local FarmUI = {
     modeToggles = {},
@@ -128,6 +129,10 @@ local FarmUI = {
     statusLabels = {},
     setFarmMode = nil, -- filled in stageFarming; sole writer of BasicFarm from UI
 }
+
+-- Forward-declare so Pause / Stop All callbacks (wired in stageFarming) can safely
+-- call the helper even though its body is defined later in this chunk.
+local forceFarmMovementCleanup
 
 local function connect(signal, fn)
     local c = signal:Connect(fn)
@@ -329,7 +334,8 @@ local function Cleanup()
     pcall(function()
         FarmRuntime.running = false
         FarmRuntime.generation = FarmRuntime.generation + 1
-        -- Inline move cleanup (cancelFarmTween is defined later in the file; do not depend on it here)
+        FarmRuntime.charHooksConnected = false
+        -- Inline move cleanup (cancelFarmTween may not exist yet during early failure)
         local tw = FarmRuntime.activeTween
         local m = FarmRuntime.move
         FarmRuntime.activeTween = nil
@@ -339,6 +345,21 @@ local function Cleanup()
         if m and m.hrp and m.hrp.Parent then
             pcall(function() m.hrp.Anchored = m.wasAnchored end)
         end
+        -- Clear leftover farm hold on the live character (Anchored + PlatformStand)
+        pcall(function()
+            local char = LocalPlayer and LocalPlayer.Character
+            if not char then return end
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hrp then
+                hrp.Anchored = false
+                hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+            end
+            if hum then
+                hum.PlatformStand = false
+            end
+        end)
         if FarmRuntime.task then
             pcall(function() task.cancel(FarmRuntime.task) end)
             FarmRuntime.task = nil
@@ -1639,6 +1660,14 @@ local function stageFarming()
         Callback = function(on)
             State.FarmPaused = on
             State.Status.CurrentAction = on and "paused" or "idle"
+            -- When pausing, release any active hold/tween so the character is not left floating
+            if on then
+                pcall(function()
+                    if forceFarmMovementCleanup then
+                        forceFarmMovementCleanup("Pause Farming ON")
+                    end
+                end)
+            end
             if FarmUI.refreshStatusUI then FarmUI.refreshStatusUI() end
             log("INFO", "Farm paused: " .. tostring(on))
         end,
@@ -1689,10 +1718,10 @@ local function stageFarming()
             State.BasicFarm = nil
             FarmRuntime.generation = FarmRuntime.generation + 1
         end
-        -- F2: every Stop All branch cancels movement + restores saved anchored state
+        -- Every Stop All path cancels tween + releases hold (Anchored + PlatformStand)
         pcall(function()
-            if type(cancelFarmTween) == "function" then
-                cancelFarmTween()
+            if forceFarmMovementCleanup then
+                forceFarmMovementCleanup("Stop All")
             end
         end)
         log("OK", "Stop All: modes cleared, UI synced, gen=" .. tostring(FarmRuntime.generation))
@@ -1782,11 +1811,20 @@ local function cancelFarmTween()
     if m and m.hrp and m.hrp.Parent then
         pcall(function() m.hrp.Anchored = m.wasAnchored end)
     end
-    -- Also clear any farm-hold anchor (stay-above-NPC) so mode changes never leave you frozen
+    -- Clear farm-hold state (Anchored + PlatformStand) so mode changes never leave you frozen
     pcall(function()
         local char = LocalPlayer and LocalPlayer.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if hrp then hrp.Anchored = false end
+        if not char then return end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hrp then
+            hrp.Anchored = false
+            hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        end
+        if hum then
+            hum.PlatformStand = false
+        end
     end)
 end
 
@@ -1888,12 +1926,42 @@ local function releaseFarmHold()
         pcall(function()
             hrp.Anchored = false
             hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
         end)
     end
     if hum then
         pcall(function()
             hum.PlatformStand = false
         end)
+    end
+end
+
+-- EE reliability: cancel tween + release hold. Safe to call repeatedly.
+-- Assigned to the forward-declared local so Pause / Stop All closures see it.
+forceFarmMovementCleanup = function(reason)
+    pcall(function()
+        cancelFarmTween()
+    end)
+    pcall(function()
+        releaseFarmHold()
+    end)
+    -- Extra safety if getCharacter() failed mid-respawn
+    pcall(function()
+        local char = LocalPlayer and LocalPlayer.Character
+        if not char then return end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hrp then
+            hrp.Anchored = false
+            hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        end
+        if hum then
+            hum.PlatformStand = false
+        end
+    end)
+    if reason then
+        log("INFO", "Farm movement cleanup: " .. tostring(reason))
     end
 end
 
@@ -2346,6 +2414,32 @@ local function startFarmController()
     if FarmRuntime.running then return end
     FarmRuntime.running = true
     log("OK", "Farm controller started")
+
+    -- Character lifecycle hooks (once only). Bump generation + clean movement so
+    -- death/respawn cannot leave Anchored/PlatformStand or a stale farm tick.
+    if LocalPlayer and not FarmRuntime.charHooksConnected then
+        FarmRuntime.charHooksConnected = true
+        connect(LocalPlayer.CharacterRemoving, function()
+            FarmRuntime.generation = FarmRuntime.generation + 1
+            if forceFarmMovementCleanup then
+                forceFarmMovementCleanup("CharacterRemoving")
+            end
+        end)
+        connect(LocalPlayer.CharacterAdded, function(char)
+            local genAtAdd = FarmRuntime.generation + 1
+            FarmRuntime.generation = genAtAdd
+            -- Delayed only long enough for HRP to exist; abort if a newer respawn won
+            task.defer(function()
+                task.wait(0.15)
+                if FarmRuntime.generation ~= genAtAdd then return end
+                if LocalPlayer.Character ~= char then return end
+                if forceFarmMovementCleanup then
+                    forceFarmMovementCleanup("CharacterAdded")
+                end
+                if FarmUI.refreshStatusUI then pcall(FarmUI.refreshStatusUI) end
+            end)
+        end)
+    end
 
     FarmRuntime.task = task.spawn(function()
         while FarmRuntime.running do
