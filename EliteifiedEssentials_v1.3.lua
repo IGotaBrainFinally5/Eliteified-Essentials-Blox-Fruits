@@ -2128,6 +2128,12 @@ forceFarmMovementCleanup = function(reason)
     pcall(function()
         releaseFarmHold()
     end)
+    -- Restore any locally modified NPC properties from farming
+    pcall(function()
+        if type(restoreAllMobProps) == "function" then
+            restoreAllMobProps()
+        end
+    end)
     -- Extra safety if getCharacter() failed mid-respawn
     pcall(function()
         local char = LocalPlayer and LocalPlayer.Character
@@ -2148,9 +2154,91 @@ forceFarmMovementCleanup = function(reason)
     end
 end
 
--- Expand NPC parts so M1 / touch range can register from farm height
+-- NPC local-property cache: capture once per mob, restore on stop/pause/target end.
+-- Client-only changes; does not guarantee server-side hit acceptance.
+local MobPropCache = {} -- [mob] = { parts = {[part]=props}, hum = props }
+
+local function isValidFarmMob(mob)
+    if not mob or not mob.Parent then return false end
+    local hum = mob:FindFirstChildOfClass("Humanoid")
+    local root = mob:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then return false end
+    if not root.Parent or not hum.Parent then return false end
+    if hum.Health <= 0 then return false end
+    return true, root, hum
+end
+
+local function captureMobProps(mob)
+    if not mob or MobPropCache[mob] then return end -- never overwrite originals with already-modified values
+    local entry = { parts = {}, hum = nil }
+    pcall(function()
+        for _, part in ipairs(mob:GetDescendants()) do
+            if part:IsA("BasePart") then
+                entry.parts[part] = {
+                    Size = part.Size,
+                    Transparency = part.Transparency,
+                    CanCollide = part.CanCollide,
+                    Massless = part.Massless,
+                }
+            end
+        end
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        if hum then
+            local jhOk, jhVal = pcall(function() return hum.JumpHeight end)
+            entry.hum = {
+                instance = hum,
+                WalkSpeed = hum.WalkSpeed,
+                JumpPower = hum.JumpPower,
+                JumpHeight = jhOk and jhVal or nil,
+            }
+        end
+    end)
+    MobPropCache[mob] = entry
+end
+
+local function restoreMobProps(mob)
+    local entry = mob and MobPropCache[mob]
+    if not entry then return end
+    MobPropCache[mob] = nil
+    pcall(function()
+        for part, props in pairs(entry.parts) do
+            if part and part.Parent then
+                pcall(function()
+                    part.Size = props.Size
+                    part.Transparency = props.Transparency
+                    part.CanCollide = props.CanCollide
+                    part.Massless = props.Massless
+                end)
+            end
+        end
+        if entry.hum and entry.hum.instance and entry.hum.instance.Parent then
+            local hum = entry.hum.instance
+            pcall(function()
+                hum.WalkSpeed = entry.hum.WalkSpeed
+                hum.JumpPower = entry.hum.JumpPower
+                if entry.hum.JumpHeight ~= nil then
+                    hum.JumpHeight = entry.hum.JumpHeight
+                end
+            end)
+        end
+    end)
+end
+
+local function restoreAllMobProps()
+    local mobs = {}
+    for mob in pairs(MobPropCache) do
+        mobs[#mobs + 1] = mob
+    end
+    for _, mob in ipairs(mobs) do
+        restoreMobProps(mob)
+    end
+end
+
+-- Apply existing local NPC visual/collision adjustments once originals are stored.
+-- Re-entry on the same mob is a no-op for capture; properties stay as first applied.
 local function expandMobHitbox(mob)
-    if not mob then return end
+    if not mob or not mob.Parent then return end
+    captureMobProps(mob)
     pcall(function()
         for _, part in ipairs(mob:GetDescendants()) do
             if part:IsA("BasePart") then
@@ -2366,56 +2454,77 @@ local function doFarmAttack(tool, mob)
     end
 end
 
--- Shared: tween above target, hold height, extended hitbox, attack while tracking mob
+-- Shared: tween above target, hold height, local NPC adjustments, attack while tracking mob
 local function farmCombatOnTarget(mob, gen, modeName)
-    local root = mob:FindFirstChild("HumanoidRootPart")
-    local hum  = mob:FindFirstChildOfClass("Humanoid")
-    if not root or not hum or hum.Health <= 0 then return end
+    local okMob, root, hum = isValidFarmMob(mob)
+    if not okMob then return end
 
     local tool = equipBestTool()
-    setNoCollide(mob, true)
+    -- Capture + apply local adjustments once (setNoCollide covered by expand CanCollide=false)
     expandMobHitbox(mob)
 
     local height = getFarmHeight()
-    State.Status.CurrentTarget = mob.Name
+    State.Status.CurrentTarget = (mob and mob.Name) or "-"
     State.Status.CurrentAction = "moving"
 
-    if not tweenTo(root.CFrame * CFrame.new(0, height, 0), nil, gen) then
+    local function finishCombat(action)
         releaseFarmHold()
+        restoreMobProps(mob)
+        State.Status.CurrentAction = action or "idle"
+        if not mob or not mob.Parent or (hum and hum.Health <= 0) then
+            State.Status.CurrentTarget = "-"
+        end
+    end
+
+    if not tweenTo(root.CFrame * CFrame.new(0, height, 0), nil, gen) then
+        finishCombat("idle")
         return
     end
-    if gen ~= FarmRuntime.generation or State.BasicFarm ~= modeName then
-        releaseFarmHold()
+    if gen ~= FarmRuntime.generation or State.BasicFarm ~= modeName or State.FarmPaused then
+        finishCombat(State.FarmPaused and "paused" or "idle")
+        return
+    end
+    if not isValidFarmMob(mob) then
+        finishCombat("idle")
         return
     end
 
     -- Re-apply hold immediately after tween (tweenTo unanchors on purpose)
-    holdAboveTarget(root)
+    if not holdAboveTarget(root) then
+        finishCombat("idle")
+        return
+    end
     State.Status.CurrentAction = "attacking"
 
     local clicks = State.FastAttack and 30 or 12
     for _ = 1, clicks do
         if gen ~= FarmRuntime.generation or State.BasicFarm ~= modeName then break end
         if State.FarmPaused then break end
-        if not mob.Parent or not root.Parent or hum.Health <= 0 then break end
+        if not isValidFarmMob(mob) then break end
+        root = mob:FindFirstChild("HumanoidRootPart")
+        hum = mob:FindFirstChildOfClass("Humanoid")
+        if not root or not hum then break end
 
-        -- Stay locked above the NPC every tick
         if not holdAboveTarget(root) then break end
-        expandMobHitbox(mob)
-        tool = tool or equipBestTool()
+        -- Do not re-expand every tick (originals already captured; avoids extra work)
+        if not tool or not tool.Parent then
+            tool = equipBestTool()
+        end
         doFarmAttack(tool, mob)
         attackWait()
     end
-    releaseFarmHold()
-    State.Status.CurrentAction = "idle"
+    finishCombat(State.FarmPaused and "paused" or "idle")
 end
 
 local function setNoCollide(model, state)
-    for _, part in ipairs(model:GetDescendants()) do
-        if part:IsA("BasePart") then
-            part.CanCollide = not state
+    if not model then return end
+    pcall(function()
+        for _, part in ipairs(model:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = not state
+            end
         end
-    end
+    end)
 end
 
 local BONE_MOBS = {
@@ -2426,27 +2535,33 @@ local BONE_MOBS = {
 }
 
 local function isBoneMob(name)
+    name = tostring(name or "")
     for _, n in ipairs(BONE_MOBS) do
         if name == n or string.find(name, n, 1, true) then
             return true
         end
+    end
+    -- Common alternate spelling in-game
+    if string.find(name, "Possessed Mummy", 1, true) then
+        return true
     end
     return false
 end
 
 local function findNearestEnemy(filterFn)
     local char, hrp = getCharacter()
-    if not hrp then return nil end
+    if not hrp or not hrp.Parent then return nil, math.huge end
     local enemies = workspace:FindFirstChild("Enemies")
-    if not enemies then return nil end
+    if not enemies then return nil, math.huge end
     local best, bestDist = nil, math.huge
-    for _, mob in ipairs(enemies:GetChildren()) do
-        local hum = mob:FindFirstChildOfClass("Humanoid")
-        local root = mob:FindFirstChild("HumanoidRootPart")
-        if hum and root and hum.Health > 0 then
+    local ok, children = pcall(function() return enemies:GetChildren() end)
+    if not ok or type(children) ~= "table" then return nil, math.huge end
+    for _, mob in ipairs(children) do
+        local valid, root = isValidFarmMob(mob)
+        if valid then
             if (not filterFn) or filterFn(mob.Name) then
                 local d = (root.Position - hrp.Position).Magnitude
-                if d < bestDist then
+                if d < bestDist and d == d then -- reject NaN
                     bestDist = d
                     best = mob
                 end
@@ -2457,12 +2572,22 @@ local function findNearestEnemy(filterFn)
 end
 
 local function findCakePrince()
+    local function pickLiving(inst)
+        if not inst then return nil end
+        local valid = isValidFarmMob(inst)
+        if valid then return inst end
+        -- Template in ReplicatedStorage may lack a living Humanoid; only use if valid for combat
+        return nil
+    end
     local enemies = workspace:FindFirstChild("Enemies")
     if enemies then
-        local cp = enemies:FindFirstChild("Cake Prince") or enemies:FindFirstChild("Dough King")
+        local cp = pickLiving(enemies:FindFirstChild("Cake Prince"))
+            or pickLiving(enemies:FindFirstChild("Dough King"))
         if cp then return cp end
     end
-    return ReplicatedStorage:FindFirstChild("Cake Prince") or ReplicatedStorage:FindFirstChild("Dough King")
+    -- Fallback: RS entries only if they happen to be valid combat instances
+    return pickLiving(ReplicatedStorage:FindFirstChild("Cake Prince"))
+        or pickLiving(ReplicatedStorage:FindFirstChild("Dough King"))
 end
 
 local lastSurprise = 0
