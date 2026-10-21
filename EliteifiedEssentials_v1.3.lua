@@ -15,7 +15,7 @@
     Diagnostics: bottom-left panel + [EE] console lines.
 ]]
 
-print("[EE] Script started - Eliteified Essentials v1.4 (stability)")
+print("[EE] Script started - Eliteified Essentials v1.4.1 (movement diagnostics)")
 
 ----------------------------------------------------------------
 -- 1. CONFIG
@@ -121,7 +121,6 @@ local FarmRuntime = {
     generation = 0,
     -- move: { tween, hrp, wasAnchored } — owned by the active tweenTo; cleared on finish/cancel
     move = nil,
-    charHooksConnected = false, -- prevents duplicate CharacterRemoving/Added connections
 }
 local FarmUI = {
     modeToggles = {},
@@ -129,10 +128,6 @@ local FarmUI = {
     statusLabels = {},
     setFarmMode = nil, -- filled in stageFarming; sole writer of BasicFarm from UI
 }
-
--- Forward-declare so Pause / Stop All callbacks (wired in stageFarming) can safely
--- call the helper even though its body is defined later in this chunk.
-local forceFarmMovementCleanup
 
 local function connect(signal, fn)
     local c = signal:Connect(fn)
@@ -334,8 +329,7 @@ local function Cleanup()
     pcall(function()
         FarmRuntime.running = false
         FarmRuntime.generation = FarmRuntime.generation + 1
-        FarmRuntime.charHooksConnected = false
-        -- Inline move cleanup (cancelFarmTween may not exist yet during early failure)
+        -- Inline move cleanup (cancelFarmTween is defined later in the file; do not depend on it here)
         local tw = FarmRuntime.activeTween
         local m = FarmRuntime.move
         FarmRuntime.activeTween = nil
@@ -345,21 +339,6 @@ local function Cleanup()
         if m and m.hrp and m.hrp.Parent then
             pcall(function() m.hrp.Anchored = m.wasAnchored end)
         end
-        -- Clear leftover farm hold on the live character (Anchored + PlatformStand)
-        pcall(function()
-            local char = LocalPlayer and LocalPlayer.Character
-            if not char then return end
-            local hrp = char:FindFirstChild("HumanoidRootPart")
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            if hrp then
-                hrp.Anchored = false
-                hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-            end
-            if hum then
-                hum.PlatformStand = false
-            end
-        end)
         if FarmRuntime.task then
             pcall(function() task.cancel(FarmRuntime.task) end)
             FarmRuntime.task = nil
@@ -430,14 +409,10 @@ local function CreateToggle(parent, opts)
     opts = opts or {}
     local state = opts.Default == true
     local hasDesc = opts.Description ~= nil
-    -- Optional darker row when ON (e.g. Bones). Off stays normal Surface.
-    local offBg = T.Surface
-    local onBg = opts.ActiveSurfaceColor or T.Surface
-    local hoverBg = T.SurfaceHover
 
     local row = new("TextButton", {
         Name = opts.Name or "Toggle", Text = "", AutoButtonColor = false,
-        BackgroundColor3 = offBg, Size = UDim2.new(1, 0, 0, hasDesc and 52 or 44),
+        BackgroundColor3 = T.Surface, Size = UDim2.new(1, 0, 0, hasDesc and 52 or 44),
         LayoutOrder = opts.LayoutOrder or 0, Parent = parent,
     }, { corner(10), stroke(T.Stroke, 1, 0.45) })
 
@@ -475,10 +450,6 @@ local function CreateToggle(parent, opts)
 
     local object = { Instance = row }
 
-    local function rowBg()
-        return state and onBg or offBg
-    end
-
     local function render(instant)
         local d = instant and 0 or 0.22
         tween(track, d, { BackgroundColor3 = state and T.Purple or T.ToggleOff })
@@ -489,7 +460,6 @@ local function CreateToggle(parent, opts)
         }, Enum.EasingStyle.Back)
         stateLabel.Text = state and "ON" or "OFF"
         tween(stateLabel, d, { TextColor3 = state and T.PurpleSoft or T.TextDim })
-        tween(row, d, { BackgroundColor3 = rowBg() })
     end
 
     function object:Set(value, silent)
@@ -507,12 +477,8 @@ local function CreateToggle(parent, opts)
     function object:Get() return state end
 
     connect(row.MouseButton1Click, function() object:Set(not state) end)
-    connect(row.MouseEnter, function()
-        tween(row, 0.15, { BackgroundColor3 = hoverBg })
-    end)
-    connect(row.MouseLeave, function()
-        tween(row, 0.15, { BackgroundColor3 = rowBg() })
-    end)
+    connect(row.MouseEnter, function() tween(row, 0.15, { BackgroundColor3 = T.SurfaceHover }) end)
+    connect(row.MouseLeave, function() tween(row, 0.15, { BackgroundColor3 = T.Surface }) end)
 
     render(true)
     return object
@@ -695,148 +661,6 @@ local function CreateCycle(parent, opts)
     end)
     connect(row.MouseEnter, function() tween(row, 0.15, { BackgroundColor3 = T.SurfaceHover }) end)
     connect(row.MouseLeave, function() tween(row, 0.15, { BackgroundColor3 = T.Surface }) end)
-    return object
-end
-
--- Compact right-aligned dropdown: label left, [ value  ▼ ] box right, list below when open
-local function CreateDropdown(parent, opts)
-    opts = opts or {}
-    local options = opts.Options or { "A", "B" }
-    local index = 1
-    for i, o in ipairs(options) do
-        if tostring(o) == tostring(opts.Default) then
-            index = i
-            break
-        end
-    end
-
-    local closedH = opts.Description and 52 or 44
-    local optionH = 28
-    local openH = closedH + (#options * optionH) + 6
-
-    local row = new("Frame", {
-        Name = opts.Name or "Dropdown",
-        BackgroundColor3 = T.Surface,
-        Size = UDim2.new(1, 0, 0, closedH),
-        LayoutOrder = opts.LayoutOrder or 0,
-        ClipsDescendants = true,
-        Parent = parent,
-    }, { corner(10), stroke(T.Stroke, 1, 0.45) })
-
-    new("TextLabel", {
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 14, 0, opts.Description and 8 or 0),
-        Size = UDim2.new(1, -130, 0, opts.Description and 18 or closedH),
-        Font = Enum.Font.GothamMedium, TextSize = 14, TextColor3 = T.Text,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextTruncate = Enum.TextTruncate.AtEnd,
-        Text = opts.Name or "Option", Parent = row,
-    })
-    if opts.Description then
-        new("TextLabel", {
-            BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 27),
-            Size = UDim2.new(1, -130, 0, 16), Font = Enum.Font.Gotham, TextSize = 11,
-            TextColor3 = T.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
-            TextTruncate = Enum.TextTruncate.AtEnd, Text = opts.Description, Parent = row,
-        })
-    end
-
-    local box = new("TextButton", {
-        Name = "DropBox", Text = "", AutoButtonColor = false,
-        AnchorPoint = Vector2.new(1, 0),
-        Position = UDim2.new(1, -14, 0, opts.Description and 10 or 8),
-        Size = UDim2.fromOffset(118, 28),
-        BackgroundColor3 = T.Panel, Parent = row,
-    }, { corner(8), stroke(T.Stroke, 1, 0.35) })
-
-    local valLabel = new("TextLabel", {
-        BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0),
-        Size = UDim2.new(1, -28, 1, 0), Font = Enum.Font.GothamBold, TextSize = 12,
-        TextColor3 = T.BlueSoft, TextXAlignment = Enum.TextXAlignment.Left,
-        TextTruncate = Enum.TextTruncate.AtEnd,
-        Text = tostring(options[index]), Parent = box,
-    })
-    new("TextLabel", {
-        BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -6, 0.5, 0), Size = UDim2.fromOffset(16, 16),
-        Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = T.TextDim,
-        Text = "▼", Parent = box,
-    })
-
-    local menu = new("Frame", {
-        Name = "Menu", BackgroundTransparency = 1, Visible = false,
-        Position = UDim2.new(1, -14, 0, closedH - 2),
-        AnchorPoint = Vector2.new(1, 0),
-        Size = UDim2.fromOffset(118, #options * optionH),
-        Parent = row,
-    }, {
-        new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 0) }),
-    })
-
-    local open = false
-    local object = { Instance = row }
-
-    local function setOpen(v)
-        open = v and true or false
-        menu.Visible = open
-        row.Size = UDim2.new(1, 0, 0, open and openH or closedH)
-        row.ZIndex = open and 20 or 1
-        box.ZIndex = open and 21 or 1
-        menu.ZIndex = open and 22 or 1
-    end
-
-    local function applyIndex(i, silent)
-        index = i
-        valLabel.Text = tostring(options[index])
-        setOpen(false)
-        if not silent and opts.Callback then
-            task.spawn(opts.Callback, options[index])
-        end
-    end
-
-    function object:Get()
-        return options[index]
-    end
-    function object:Set(v, silent)
-        for i, o in ipairs(options) do
-            if tostring(o) == tostring(v) then
-                applyIndex(i, silent)
-                return
-            end
-        end
-    end
-
-    for i, o in ipairs(options) do
-        local optBtn = new("TextButton", {
-            Name = "Opt_" .. tostring(o),
-            Text = tostring(o), AutoButtonColor = false,
-            BackgroundColor3 = T.Panel, Size = UDim2.new(1, 0, 0, optionH),
-            Font = Enum.Font.GothamMedium, TextSize = 12,
-            TextColor3 = T.Text, LayoutOrder = i, Parent = menu,
-        }, { corner(6) })
-        connect(optBtn.MouseEnter, function()
-            tween(optBtn, 0.12, { BackgroundColor3 = T.SurfaceHover })
-        end)
-        connect(optBtn.MouseLeave, function()
-            tween(optBtn, 0.12, { BackgroundColor3 = T.Panel })
-        end)
-        connect(optBtn.MouseButton1Click, function()
-            applyIndex(i, false)
-        end)
-    end
-
-    connect(box.MouseButton1Click, function()
-        setOpen(not open)
-    end)
-    connect(box.MouseEnter, function()
-        tween(box, 0.12, { BackgroundColor3 = T.SurfaceHover })
-    end)
-    connect(box.MouseLeave, function()
-        if not open then
-            tween(box, 0.12, { BackgroundColor3 = T.Panel })
-        end
-    end)
-
     return object
 end
 
@@ -1373,12 +1197,6 @@ local function stageWindow()
             return CreateCycle(tab.Page, o)
         end
 
-        function tab:AddDropdown(o)
-            o = o or {}
-            o.LayoutOrder = nextOrder()
-            return CreateDropdown(tab.Page, o)
-        end
-
         connect(tab.Button.MouseButton1Click, function() Window:SelectTab(tab) end)
         connect(tab.Button.MouseEnter, function()
             if Window.Selected ~= tab then tween(tab.Button, 0.15, { BackgroundTransparency = 0.92 }) end
@@ -1507,7 +1325,7 @@ local function stageFarming()
     ----------------------------------------------------------------
     Farming:AddSection("Combat Settings")
 
-    local combatModeDropdown = Farming:AddDropdown({
+    Farming:AddCycle({
         Name = "Selected Mode",
         Description = "Equips a matching tool from backpack when possible",
         Options = { "Melee", "Blox Fruits", "Sword", "Gun" },
@@ -1524,7 +1342,6 @@ local function stageFarming()
             if FarmUI.refreshStatusUI then pcall(FarmUI.refreshStatusUI) end
         end,
     })
-    FarmUI.combatModeDropdown = combatModeDropdown
 
     Farming:AddSlider({
         Name = "Attack Delay",
@@ -1611,17 +1428,11 @@ local function stageFarming()
         end,
     })
 
-    local maxTargetsDefault = "5"
-    if State.BringMaxTargets == math.huge then
-        maxTargetsDefault = "All"
-    elseif State.BringMaxTargets then
-        maxTargetsDefault = tostring(State.BringMaxTargets)
-    end
-    local maxTargetsDropdown = Farming:AddDropdown({
+    Farming:AddCycle({
         Name = "Max Targets",
         Description = "Configured max target count",
         Options = { "2", "3", "4", "5", "6", "7", "8", "9", "10", "All" },
-        Default = maxTargetsDefault,
+        Default = "5",
         Callback = function(v)
             if v == "All" then
                 State.BringMaxTargets = math.huge
@@ -1631,7 +1442,6 @@ local function stageFarming()
             refreshBringStatus()
         end,
     })
-    FarmUI.maxTargetsDropdown = maxTargetsDropdown
 
     bringStatusLabel = new("TextLabel", {
         BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28),
@@ -1717,7 +1527,7 @@ local function stageFarming()
     FarmUI.setFarmMode = setFarmMode
 
     local function makeModeToggle(name)
-        local togOpts = {
+        farmToggles[name] = Farming:AddToggle({
             Name = name,
             Default = false,
             SyncCallback = true,
@@ -1730,12 +1540,7 @@ local function stageFarming()
                     if farmToggles[name] then farmToggles[name]:Set(false, true) end
                 end
             end,
-        }
-        -- Bones only: darker surface when enabled (same size/position)
-        if name == "Bones" then
-            togOpts.ActiveSurfaceColor = Color3.fromRGB(12, 14, 22)
-        end
-        farmToggles[name] = Farming:AddToggle(togOpts)
+        })
         return farmToggles[name]
     end
 
@@ -1834,14 +1639,6 @@ local function stageFarming()
         Callback = function(on)
             State.FarmPaused = on
             State.Status.CurrentAction = on and "paused" or "idle"
-            -- When pausing, release any active hold/tween so the character is not left floating
-            if on then
-                pcall(function()
-                    if forceFarmMovementCleanup then
-                        forceFarmMovementCleanup("Pause Farming ON")
-                    end
-                end)
-            end
             if FarmUI.refreshStatusUI then FarmUI.refreshStatusUI() end
             log("INFO", "Farm paused: " .. tostring(on))
         end,
@@ -1892,10 +1689,10 @@ local function stageFarming()
             State.BasicFarm = nil
             FarmRuntime.generation = FarmRuntime.generation + 1
         end
-        -- Every Stop All path cancels tween + releases hold (Anchored + PlatformStand)
+        -- F2: every Stop All branch cancels movement + restores saved anchored state
         pcall(function()
-            if forceFarmMovementCleanup then
-                forceFarmMovementCleanup("Stop All")
+            if type(cancelFarmTween) == "function" then
+                cancelFarmTween()
             end
         end)
         log("OK", "Stop All: modes cleared, UI synced, gen=" .. tostring(FarmRuntime.generation))
@@ -1931,7 +1728,7 @@ local function stageFarming()
         end
     end)
 
-    -- Load saved settings if present (update State + sync dropdown display, silent)
+    -- Load saved settings if present
     pcall(function()
         local s = getEnv().EliteifiedEssentials_Settings
         if type(s) == "table" then
@@ -1941,15 +1738,6 @@ local function stageFarming()
             if s.BringEnabled ~= nil then State.BringEnabled = s.BringEnabled end
             if s.BringRange then State.BringRange = s.BringRange end
             if s.BringMaxTargets then State.BringMaxTargets = s.BringMaxTargets end
-            -- Reflect loaded values in dropdowns without re-firing callbacks
-            if FarmUI.combatModeDropdown and State.CombatMode then
-                FarmUI.combatModeDropdown:Set(State.CombatMode, true)
-            end
-            if FarmUI.maxTargetsDropdown then
-                local mt = State.BringMaxTargets
-                local label = (mt == math.huge) and "All" or tostring(mt or 5)
-                FarmUI.maxTargetsDropdown:Set(label, true)
-            end
             refreshBringStatus()
             log("INFO", "Loaded saved UI settings")
         end
@@ -1979,10 +1767,30 @@ local function getCommF()
     return remotes:FindFirstChild("CommF_")
 end
 
+-- EE diagnostic: compact position string (not every frame)
+local function fmtPos(v3)
+    if not v3 then return "?" end
+    return string.format("(%.1f, %.1f, %.1f)", v3.X, v3.Y, v3.Z)
+end
+
+-- EE diagnostic: log character / HRP replacements once each time they happen
+pcall(function()
+    LocalPlayer.CharacterAdded:Connect(function(char)
+        log("INFO", "Character respawned/replaced gen=" .. tostring(FarmRuntime.generation))
+        pcall(function()
+            local hrp = char:WaitForChild("HumanoidRootPart", 5)
+            if hrp then
+                log("INFO", "New HumanoidRootPart at " .. fmtPos(hrp.Position))
+            end
+        end)
+    end)
+end)
+
 -- EE v1.4: cancel in-flight farm tween and always restore that move's anchored state
 local function cancelFarmTween()
     local m = FarmRuntime.move
     local tw = FarmRuntime.activeTween
+    local had = (m ~= nil) or (tw ~= nil)
     FarmRuntime.move = nil
     FarmRuntime.activeTween = nil
     if tw then
@@ -1994,21 +1802,21 @@ local function cancelFarmTween()
     if m and m.hrp and m.hrp.Parent then
         pcall(function() m.hrp.Anchored = m.wasAnchored end)
     end
-    -- Clear farm-hold state (Anchored + PlatformStand) so mode changes never leave you frozen
+    -- Also clear any farm-hold anchor (stay-above-NPC) so mode changes never leave you frozen
     pcall(function()
         local char = LocalPlayer and LocalPlayer.Character
-        if not char then return end
-        local hrp = char:FindFirstChild("HumanoidRootPart")
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hrp then
-            hrp.Anchored = false
-            hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-        end
-        if hum then
-            hum.PlatformStand = false
-        end
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then hrp.Anchored = false end
     end)
+    -- Diagnostic only: log when there was something to cancel
+    if had then
+        local pos = "?"
+        pcall(function()
+            local _, hrp = getCharacter()
+            if hrp then pos = fmtPos(hrp.Position) end
+        end)
+        log("INFO", "cancelFarmTween gen=" .. tostring(FarmRuntime.generation) .. " pos=" .. pos)
+    end
 end
 
 local function tweenTo(cf, speed, gen)
@@ -2039,8 +1847,18 @@ local function tweenTo(cf, speed, gen)
     FarmRuntime.move = move
     FarmRuntime.activeTween = nil
 
+    -- Diagnostic: tween start (once per tween)
+    log("INFO", string.format(
+        "tweenTo START gen=%s dist=%.1f from=%s to=%s",
+        tostring(gen or FarmRuntime.generation),
+        dist,
+        fmtPos(hrp.Position),
+        fmtPos(cf.Position)
+    ))
+
     local function releaseIfOwner()
         if FarmRuntime.move ~= move then
+            log("INFO", "releaseIfOwner SKIP (not owner) gen=" .. tostring(FarmRuntime.generation))
             return -- cancelFarmTween / newer move already cleaned up
         end
         FarmRuntime.move = nil
@@ -2051,6 +1869,9 @@ local function tweenTo(cf, speed, gen)
         if hrp.Parent then
             pcall(function() hrp.Anchored = wasAnchored end)
         end
+        log("INFO", "releaseIfOwner DONE gen=" .. tostring(FarmRuntime.generation)
+            .. " pos=" .. fmtPos(hrp.Parent and hrp.Position or nil)
+            .. " anchored->" .. tostring(wasAnchored))
     end
 
     -- F1: Create, Play, and Wait are all inside pcall so failures cannot skip restore
@@ -2071,8 +1892,16 @@ local function tweenTo(cf, speed, gen)
     -- Always release if we still own the slot (does not rely solely on Completed resuming)
     releaseIfOwner()
 
-    if not ok then return false end
-    if gen and gen ~= FarmRuntime.generation then return false end
+    local endPos = hrp.Parent and fmtPos(hrp.Position) or "?"
+    if not ok then
+        log("WARN", "tweenTo FAIL/CANCEL gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos)
+        return false
+    end
+    if gen and gen ~= FarmRuntime.generation then
+        log("INFO", "tweenTo STALE gen arg=" .. tostring(gen) .. " now=" .. tostring(FarmRuntime.generation) .. " pos=" .. endPos)
+        return false
+    end
+    log("INFO", "tweenTo COMPLETE gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos)
     return true
 end
 
@@ -2089,6 +1918,14 @@ local function holdAboveTarget(targetRoot)
     local char, hrp, hum = getCharacter()
     if not char or not hrp or not targetRoot or not targetRoot.Parent then return false end
     local height = getFarmHeight()
+    -- Diagnostic: only log the first hold in a streak (not every attack tick)
+    if not FarmRuntime._holdLogged then
+        FarmRuntime._holdLogged = true
+        log("INFO", "holdAboveTarget BEGIN height=" .. tostring(height)
+            .. " gen=" .. tostring(FarmRuntime.generation)
+            .. " at=" .. fmtPos(hrp.Position)
+            .. " target=" .. fmtPos(targetRoot.Position))
+    end
     local ok = pcall(function()
         -- Kill velocity so physics does not pull you out of the hold
         hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
@@ -2104,12 +1941,12 @@ local function holdAboveTarget(targetRoot)
 end
 
 local function releaseFarmHold()
+    FarmRuntime._holdLogged = false -- allow next holdAboveTarget to log once
     local char, hrp, hum = getCharacter()
     if hrp and hrp.Parent then
         pcall(function()
             hrp.Anchored = false
             hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
         end)
     end
     if hum then
@@ -2119,126 +1956,18 @@ local function releaseFarmHold()
     end
 end
 
--- EE reliability: cancel tween + release hold. Safe to call repeatedly.
--- Assigned to the forward-declared local so Pause / Stop All closures see it.
-forceFarmMovementCleanup = function(reason)
-    pcall(function()
-        cancelFarmTween()
-    end)
-    pcall(function()
-        releaseFarmHold()
-    end)
-    -- Restore any locally modified NPC properties from farming
-    pcall(function()
-        if type(restoreAllMobProps) == "function" then
-            restoreAllMobProps()
+local function setNoCollide(model, state)
+    if not model then return end
+    for _, part in ipairs(model:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = not state
         end
-    end)
-    -- Extra safety if getCharacter() failed mid-respawn
-    pcall(function()
-        local char = LocalPlayer and LocalPlayer.Character
-        if not char then return end
-        local hrp = char:FindFirstChild("HumanoidRootPart")
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hrp then
-            hrp.Anchored = false
-            hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-        end
-        if hum then
-            hum.PlatformStand = false
-        end
-    end)
-    if reason then
-        log("INFO", "Farm movement cleanup: " .. tostring(reason))
     end
 end
 
--- NPC local-property cache: capture once per mob, restore on stop/pause/target end.
--- Client-only changes; does not guarantee server-side hit acceptance.
-local MobPropCache = {} -- [mob] = { parts = {[part]=props}, hum = props }
-
-local function isValidFarmMob(mob)
-    if not mob or not mob.Parent then return false end
-    local hum = mob:FindFirstChildOfClass("Humanoid")
-    local root = mob:FindFirstChild("HumanoidRootPart")
-    if not hum or not root then return false end
-    if not root.Parent or not hum.Parent then return false end
-    if hum.Health <= 0 then return false end
-    return true, root, hum
-end
-
-local function captureMobProps(mob)
-    if not mob or MobPropCache[mob] then return end -- never overwrite originals with already-modified values
-    local entry = { parts = {}, hum = nil }
-    pcall(function()
-        for _, part in ipairs(mob:GetDescendants()) do
-            if part:IsA("BasePart") then
-                entry.parts[part] = {
-                    Size = part.Size,
-                    Transparency = part.Transparency,
-                    CanCollide = part.CanCollide,
-                    Massless = part.Massless,
-                }
-            end
-        end
-        local hum = mob:FindFirstChildOfClass("Humanoid")
-        if hum then
-            local jhOk, jhVal = pcall(function() return hum.JumpHeight end)
-            entry.hum = {
-                instance = hum,
-                WalkSpeed = hum.WalkSpeed,
-                JumpPower = hum.JumpPower,
-                JumpHeight = jhOk and jhVal or nil,
-            }
-        end
-    end)
-    MobPropCache[mob] = entry
-end
-
-local function restoreMobProps(mob)
-    local entry = mob and MobPropCache[mob]
-    if not entry then return end
-    MobPropCache[mob] = nil
-    pcall(function()
-        for part, props in pairs(entry.parts) do
-            if part and part.Parent then
-                pcall(function()
-                    part.Size = props.Size
-                    part.Transparency = props.Transparency
-                    part.CanCollide = props.CanCollide
-                    part.Massless = props.Massless
-                end)
-            end
-        end
-        if entry.hum and entry.hum.instance and entry.hum.instance.Parent then
-            local hum = entry.hum.instance
-            pcall(function()
-                hum.WalkSpeed = entry.hum.WalkSpeed
-                hum.JumpPower = entry.hum.JumpPower
-                if entry.hum.JumpHeight ~= nil then
-                    hum.JumpHeight = entry.hum.JumpHeight
-                end
-            end)
-        end
-    end)
-end
-
-local function restoreAllMobProps()
-    local mobs = {}
-    for mob in pairs(MobPropCache) do
-        mobs[#mobs + 1] = mob
-    end
-    for _, mob in ipairs(mobs) do
-        restoreMobProps(mob)
-    end
-end
-
--- Apply existing local NPC visual/collision adjustments once originals are stored.
--- Re-entry on the same mob is a no-op for capture; properties stay as first applied.
+-- Expand NPC parts so M1 / touch range can register from farm height
 local function expandMobHitbox(mob)
-    if not mob or not mob.Parent then return end
-    captureMobProps(mob)
+    if not mob then return end
     pcall(function()
         for _, part in ipairs(mob:GetDescendants()) do
             if part:IsA("BasePart") then
@@ -2454,77 +2183,48 @@ local function doFarmAttack(tool, mob)
     end
 end
 
--- Shared: tween above target, hold height, local NPC adjustments, attack while tracking mob
+-- Shared: tween above target, hold height, extended hitbox, attack while tracking mob
 local function farmCombatOnTarget(mob, gen, modeName)
-    local okMob, root, hum = isValidFarmMob(mob)
-    if not okMob then return end
+    local root = mob:FindFirstChild("HumanoidRootPart")
+    local hum  = mob:FindFirstChildOfClass("Humanoid")
+    if not root or not hum or hum.Health <= 0 then return end
 
     local tool = equipBestTool()
-    -- Capture + apply local adjustments once (setNoCollide covered by expand CanCollide=false)
+    setNoCollide(mob, true)
     expandMobHitbox(mob)
 
     local height = getFarmHeight()
-    State.Status.CurrentTarget = (mob and mob.Name) or "-"
+    State.Status.CurrentTarget = mob.Name
     State.Status.CurrentAction = "moving"
 
-    local function finishCombat(action)
-        releaseFarmHold()
-        restoreMobProps(mob)
-        State.Status.CurrentAction = action or "idle"
-        if not mob or not mob.Parent or (hum and hum.Health <= 0) then
-            State.Status.CurrentTarget = "-"
-        end
-    end
-
     if not tweenTo(root.CFrame * CFrame.new(0, height, 0), nil, gen) then
-        finishCombat("idle")
+        releaseFarmHold()
         return
     end
-    if gen ~= FarmRuntime.generation or State.BasicFarm ~= modeName or State.FarmPaused then
-        finishCombat(State.FarmPaused and "paused" or "idle")
-        return
-    end
-    if not isValidFarmMob(mob) then
-        finishCombat("idle")
+    if gen ~= FarmRuntime.generation or State.BasicFarm ~= modeName then
+        releaseFarmHold()
         return
     end
 
     -- Re-apply hold immediately after tween (tweenTo unanchors on purpose)
-    if not holdAboveTarget(root) then
-        finishCombat("idle")
-        return
-    end
+    holdAboveTarget(root)
     State.Status.CurrentAction = "attacking"
 
     local clicks = State.FastAttack and 30 or 12
     for _ = 1, clicks do
         if gen ~= FarmRuntime.generation or State.BasicFarm ~= modeName then break end
         if State.FarmPaused then break end
-        if not isValidFarmMob(mob) then break end
-        root = mob:FindFirstChild("HumanoidRootPart")
-        hum = mob:FindFirstChildOfClass("Humanoid")
-        if not root or not hum then break end
+        if not mob.Parent or not root.Parent or hum.Health <= 0 then break end
 
+        -- Stay locked above the NPC every tick
         if not holdAboveTarget(root) then break end
-        -- Do not re-expand every tick (originals already captured; avoids extra work)
-        if not tool or not tool.Parent then
-            tool = equipBestTool()
-        end
+        expandMobHitbox(mob)
+        tool = tool or equipBestTool()
         doFarmAttack(tool, mob)
         attackWait()
     end
-    finishCombat(State.FarmPaused and "paused" or "idle")
-end
-
-local function setNoCollide(model, state)
-    if not model then return end
-    pcall(function()
-        for _, part in ipairs(model:GetDescendants()) do
-            if part:IsA("BasePart") then
-                part.CanCollide = not state
-            end
-        end
-    end)
+    releaseFarmHold()
+    State.Status.CurrentAction = "idle"
 end
 
 local BONE_MOBS = {
@@ -2535,33 +2235,27 @@ local BONE_MOBS = {
 }
 
 local function isBoneMob(name)
-    name = tostring(name or "")
     for _, n in ipairs(BONE_MOBS) do
         if name == n or string.find(name, n, 1, true) then
             return true
         end
-    end
-    -- Common alternate spelling in-game
-    if string.find(name, "Possessed Mummy", 1, true) then
-        return true
     end
     return false
 end
 
 local function findNearestEnemy(filterFn)
     local char, hrp = getCharacter()
-    if not hrp or not hrp.Parent then return nil, math.huge end
+    if not hrp then return nil end
     local enemies = workspace:FindFirstChild("Enemies")
-    if not enemies then return nil, math.huge end
+    if not enemies then return nil end
     local best, bestDist = nil, math.huge
-    local ok, children = pcall(function() return enemies:GetChildren() end)
-    if not ok or type(children) ~= "table" then return nil, math.huge end
-    for _, mob in ipairs(children) do
-        local valid, root = isValidFarmMob(mob)
-        if valid then
+    for _, mob in ipairs(enemies:GetChildren()) do
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        local root = mob:FindFirstChild("HumanoidRootPart")
+        if hum and root and hum.Health > 0 then
             if (not filterFn) or filterFn(mob.Name) then
                 local d = (root.Position - hrp.Position).Magnitude
-                if d < bestDist and d == d then -- reject NaN
+                if d < bestDist then
                     bestDist = d
                     best = mob
                 end
@@ -2572,22 +2266,12 @@ local function findNearestEnemy(filterFn)
 end
 
 local function findCakePrince()
-    local function pickLiving(inst)
-        if not inst then return nil end
-        local valid = isValidFarmMob(inst)
-        if valid then return inst end
-        -- Template in ReplicatedStorage may lack a living Humanoid; only use if valid for combat
-        return nil
-    end
     local enemies = workspace:FindFirstChild("Enemies")
     if enemies then
-        local cp = pickLiving(enemies:FindFirstChild("Cake Prince"))
-            or pickLiving(enemies:FindFirstChild("Dough King"))
+        local cp = enemies:FindFirstChild("Cake Prince") or enemies:FindFirstChild("Dough King")
         if cp then return cp end
     end
-    -- Fallback: RS entries only if they happen to be valid combat instances
-    return pickLiving(ReplicatedStorage:FindFirstChild("Cake Prince"))
-        or pickLiving(ReplicatedStorage:FindFirstChild("Dough King"))
+    return ReplicatedStorage:FindFirstChild("Cake Prince") or ReplicatedStorage:FindFirstChild("Dough King")
 end
 
 local lastSurprise = 0
@@ -2664,11 +2348,16 @@ local function farmBones()
         State.Status.CurrentTarget = "-"
         local char, hrp = getCharacter()
         if hrp and (hrp.Position - Vector3.new(-9500, 150, 5800)).Magnitude > 400 then
+            log("INFO", "Bones: no NPC found — pathing to fixed dest gen=" .. tostring(gen)
+                .. " from=" .. fmtPos(hrp.Position))
             tweenTo(CFrame.new(-9508, 142, 5737), nil, gen)
+        else
+            log("INFO", "Bones: no NPC found — already near fixed area gen=" .. tostring(gen))
         end
         return
     end
 
+    log("INFO", "Bones: NPC found name=" .. tostring(mob.Name) .. " gen=" .. tostring(gen))
     farmCombatOnTarget(mob, gen, "Bones")
 end
 
@@ -2722,32 +2411,6 @@ local function startFarmController()
     if FarmRuntime.running then return end
     FarmRuntime.running = true
     log("OK", "Farm controller started")
-
-    -- Character lifecycle hooks (once only). Bump generation + clean movement so
-    -- death/respawn cannot leave Anchored/PlatformStand or a stale farm tick.
-    if LocalPlayer and not FarmRuntime.charHooksConnected then
-        FarmRuntime.charHooksConnected = true
-        connect(LocalPlayer.CharacterRemoving, function()
-            FarmRuntime.generation = FarmRuntime.generation + 1
-            if forceFarmMovementCleanup then
-                forceFarmMovementCleanup("CharacterRemoving")
-            end
-        end)
-        connect(LocalPlayer.CharacterAdded, function(char)
-            local genAtAdd = FarmRuntime.generation + 1
-            FarmRuntime.generation = genAtAdd
-            -- Delayed only long enough for HRP to exist; abort if a newer respawn won
-            task.defer(function()
-                task.wait(0.15)
-                if FarmRuntime.generation ~= genAtAdd then return end
-                if LocalPlayer.Character ~= char then return end
-                if forceFarmMovementCleanup then
-                    forceFarmMovementCleanup("CharacterAdded")
-                end
-                if FarmUI.refreshStatusUI then pcall(FarmUI.refreshStatusUI) end
-            end)
-        end)
-    end
 
     FarmRuntime.task = task.spawn(function()
         while FarmRuntime.running do
