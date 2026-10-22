@@ -1,21 +1,15 @@
 --[[
-    Eliteified Essentials (BLOX FRUITS) - v1.4 (stability)
-    UI Framework + Gameplay Automation
+    Eliteified Essentials (BLOX FRUITS) - NEW REMAKE v1
+    Same features/UI as EE v1.4, rebuilt movement controller.
 
-    v1.3: Farming loops + Bones Options
-    v1.4: Combat/Bring UI, diagnostics, Clear Log / Stop All
-    v1.4 stability:
-      - Single synchronous writer for State.BasicFarm (no async mode races)
-      - Cancel in-flight farm tweens; generation token aborts stale ticks
-      - TweenSpeed is the only movement speed source (no hardcoded 280/300)
-      - Bones options shown under Bones when ON (no separate dropdown)
-      - State.Effects defaults OFF (UI portal FX only — not engine combat anim)
-      - Honest equipped-item / Haki / mode-match status (Unknown when unverified)
-
-    Diagnostics: bottom-left panel + [EE] console lines.
+    Movement changes:
+      - tweenTo(..., gen, opts) with opts.stayAnchored for waypoint pins
+      - On successful waypoint arrive: keep Anchored=true and re-pin CFrame
+      - cancelFarmTween / mode change still fully releases the character
+      - Hold-above combat path unchanged in behavior
 ]]
 
-print("[EE] Script started - Eliteified Essentials v1.4.4 (cf-change observer)")
+print("[EE] Script started - Eliteified Essentials NEW REMAKE v1")
 
 ----------------------------------------------------------------
 -- 1. CONFIG
@@ -26,10 +20,9 @@ local Config = {
     BrandMain      = "E.E.",
     BrandSub       = "Elites Essentials",
 
-    -- ~90% of original 560x340 for a slightly smaller main window (text sizes unchanged)
-    WindowSize     = Vector2.new(504, 306),
-    SidebarWidth   = 52,
-    TitleBarHeight = 36,
+    WindowSize     = Vector2.new(560, 340),
+    SidebarWidth   = 58,
+    TitleBarHeight = 40,
     ToggleKey      = Enum.KeyCode.RightControl, -- hide/show (PC only)
 
     -- Diagnostics
@@ -2023,7 +2016,12 @@ local function cancelFarmTween()
     end
 end
 
-local function tweenTo(cf, speed, gen)
+-- opts.stayAnchored = true keeps HRP anchored at destination after a successful tween
+-- (used for Bones/Cake search waypoints so we do not immediately float free at the destination)
+local function tweenTo(cf, speed, gen, opts)
+    opts = opts or {}
+    local stayAnchored = opts.stayAnchored == true
+
     local char, hrp = getCharacter()
     if not char or not hrp then return false end
 
@@ -2050,6 +2048,7 @@ local function tweenTo(cf, speed, gen)
         hrp = hrp,
         wasAnchored = wasAnchored,
         tripId = tripId,
+        stayAnchored = stayAnchored,
     }
 
     -- Own the move slot before any state change; every exit path must release or hand off via cancel.
@@ -2058,10 +2057,11 @@ local function tweenTo(cf, speed, gen)
 
     -- Diagnostic: tween start (once per tween)
     log("INFO", string.format(
-        "tweenTo START trip=%d gen=%s dist=%.1f from=%s to=%s",
+        "tweenTo START trip=%d gen=%s dist=%.1f stayAnchored=%s from=%s to=%s",
         tripId,
         tostring(gen or FarmRuntime.generation),
         dist,
+        tostring(stayAnchored),
         fmtPos(hrp.Position),
         fmtPos(cf.Position)
     ))
@@ -2072,11 +2072,29 @@ local function tweenTo(cf, speed, gen)
                 .. " gen=" .. tostring(FarmRuntime.generation))
             return -- cancelFarmTween / newer move already cleaned up
         end
-        FarmRuntime.move = nil
         local ownedTw = move.tween
         if FarmRuntime.activeTween == ownedTw then
             FarmRuntime.activeTween = nil
         end
+
+        if stayAnchored and hrp.Parent then
+            -- Keep ownership slot so cancelFarmTween still knows which HRP we pinned
+            -- Re-pin CFrame and stay anchored (search waypoint)
+            log("INFO", "HRP_WRITE releaseIfOwner PIN stayAnchored trip=" .. tostring(tripId))
+            pcall(function()
+                hrp.Anchored = true
+                hrp.CFrame = cf
+                hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            end)
+            move.tween = nil
+            log("INFO", "releaseIfOwner DONE (pinned) trip=" .. tostring(tripId)
+                .. " gen=" .. tostring(FarmRuntime.generation)
+                .. " pos=" .. fmtPos(hrp.Position)
+                .. " anchored=true")
+            return
+        end
+
+        FarmRuntime.move = nil
         if hrp.Parent then
             log("INFO", "HRP_WRITE releaseIfOwner Anchored=" .. tostring(wasAnchored)
                 .. " trip=" .. tostring(tripId))
@@ -2127,9 +2145,10 @@ local function tweenTo(cf, speed, gen)
     log("INFO", "tweenTo COMPLETE trip=" .. tostring(tripId)
         .. " gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos
         .. " anchored=" .. tostring(hrp.Anchored)
+        .. " stayAnchored=" .. tostring(stayAnchored)
         .. " sameChar=" .. tostring(LocalPlayer.Character == char))
 
-    -- Diagnostic: post-COMPLETE window (snap usually ~0.2s); replaces "during" watcher
+    -- Diagnostic: post-COMPLETE window; replaces "during" watcher
     startCfWatch(hrp, char, tripId, "after", 0.55)
 
     -- Diagnostic only: sample after cleanup. Closures capture THIS tripId (not a later trip).
@@ -2617,7 +2636,8 @@ local function farmBones()
         if hrp and (hrp.Position - Vector3.new(-9500, 150, 5800)).Magnitude > 400 then
             log("INFO", "Bones: no NPC found — pathing to fixed dest gen=" .. tostring(gen)
                 .. " from=" .. fmtPos(hrp.Position))
-            tweenTo(CFrame.new(-9508, 142, 5737), nil, gen)
+            -- Pin at destination until next move/cancel (search waypoint)
+            tweenTo(CFrame.new(-9508, 142, 5737), nil, gen, { stayAnchored = true })
         else
             log("INFO", "Bones: no NPC found — already near fixed area gen=" .. tostring(gen))
         end
@@ -2656,7 +2676,7 @@ local function farmCake()
         State.Status.CurrentAction = "searching"
         local char, hrp = getCharacter()
         if hrp and (hrp.Position - Vector3.new(-2100, 70, -12000)).Magnitude > 500 then
-            tweenTo(CFrame.new(-2092, 70, -12160), nil, gen)
+            tweenTo(CFrame.new(-2092, 70, -12160), nil, gen, { stayAnchored = true })
         end
         return
     end
@@ -2782,5 +2802,5 @@ for _, s in ipairs(stages) do
     end
 end
 
-log("OK", "Eliteified Essentials v1.4 loaded (UI + gameplay)")
+log("OK", "Eliteified Essentials NEW REMAKE v1 loaded (UI + gameplay)")
 finishDiag(true)
