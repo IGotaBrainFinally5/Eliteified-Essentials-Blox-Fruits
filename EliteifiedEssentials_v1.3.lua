@@ -15,7 +15,7 @@
     Diagnostics: bottom-left panel + [EE] console lines.
 ]]
 
-print("[EE] Script started - Eliteified Essentials v1.4.1 (movement diagnostics)")
+print("[EE] Script started - Eliteified Essentials v1.4.2 (post-tween position samples)")
 
 ----------------------------------------------------------------
 -- 1. CONFIG
@@ -1901,7 +1901,36 @@ local function tweenTo(cf, speed, gen)
         log("INFO", "tweenTo STALE gen arg=" .. tostring(gen) .. " now=" .. tostring(FarmRuntime.generation) .. " pos=" .. endPos)
         return false
     end
-    log("INFO", "tweenTo COMPLETE gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos)
+    log("INFO", "tweenTo COMPLETE gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos
+        .. " anchored=" .. tostring(hrp.Anchored)
+        .. " sameChar=" .. tostring(LocalPlayer.Character == char))
+
+    -- Diagnostic only: sample after cleanup (not every frame). Does not move the character.
+    local sampleHrp = hrp
+    local sampleChar = char
+    local sampleGen = tostring(gen or FarmRuntime.generation)
+    local function postSample(label)
+        local curChar = LocalPlayer.Character
+        local sameChar = (curChar ~= nil and sampleChar ~= nil and curChar == sampleChar)
+        local hrpOk = sampleHrp and sampleHrp.Parent ~= nil
+        local hrpIsCurrent = hrpOk and curChar and sampleHrp:IsDescendantOf(curChar)
+        if hrpOk then
+            log("INFO", string.format(
+                "%s gen=%s pos=%s anchored=%s sameChar=%s hrpIsCurrent=%s",
+                label, sampleGen, fmtPos(sampleHrp.Position),
+                tostring(sampleHrp.Anchored), tostring(sameChar), tostring(hrpIsCurrent == true)
+            ))
+        else
+            log("INFO", string.format(
+                "%s gen=%s pos=(hrp gone) sameChar=%s hrpIsCurrent=false",
+                label, sampleGen, tostring(sameChar)
+            ))
+        end
+    end
+    task.defer(function() postSample("tweenTo POST-defer") end)
+    task.delay(0.2, function() postSample("tweenTo POST-0.2s") end)
+    task.delay(0.6, function() postSample("tweenTo POST-0.6s") end)
+
     return true
 end
 
