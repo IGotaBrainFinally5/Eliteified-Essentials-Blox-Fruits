@@ -15,7 +15,7 @@
     Diagnostics: bottom-left panel + [EE] console lines.
 ]]
 
-print("[EE] Script started - Eliteified Essentials v1.4.3 (trip-id diagnostics)")
+print("[EE] Script started - Eliteified Essentials v1.4.4 (cf-change observer)")
 
 ----------------------------------------------------------------
 -- 1. CONFIG
@@ -123,6 +123,8 @@ local FarmRuntime = {
     -- move: { tween, hrp, wasAnchored, tripId } — owned by the active tweenTo; cleared on finish/cancel
     move = nil,
     tripId = 0, -- diagnostic: increments once per tweenTo attempt
+    cfWatchConn = nil, -- diagnostic: temporary CFrame watcher
+    cfWatchGen = 0,    -- disconnect token so delayed stops don't kill a newer watch
 }
 local FarmUI = {
     modeToggles = {},
@@ -384,6 +386,12 @@ local function Cleanup()
         if FarmRuntime.task then
             pcall(function() task.cancel(FarmRuntime.task) end)
             FarmRuntime.task = nil
+        end
+        -- Diagnostic: drop CFrame watcher (stopCfWatch defined later; disconnect raw conn here)
+        FarmRuntime.cfWatchGen = (FarmRuntime.cfWatchGen or 0) + 1
+        if FarmRuntime.cfWatchConn then
+            pcall(function() FarmRuntime.cfWatchConn:Disconnect() end)
+            FarmRuntime.cfWatchConn = nil
         end
     end)
     for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
@@ -1887,10 +1895,83 @@ local function fmtPos(v3)
     return string.format("(%.1f, %.1f, %.1f)", v3.X, v3.Y, v3.Z)
 end
 
+-- EE diagnostic only: stop temporary HRP CFrame watcher (no movement side effects)
+local function stopCfWatch()
+    FarmRuntime.cfWatchGen = (FarmRuntime.cfWatchGen or 0) + 1
+    local c = FarmRuntime.cfWatchConn
+    FarmRuntime.cfWatchConn = nil
+    if c then
+        pcall(function() c:Disconnect() end)
+    end
+end
+
+-- EE diagnostic only: observe CFrame changes (throttled). Does not claim cause.
+-- phase "during" = tween in progress; "after" = post-COMPLETE snap window
+local function startCfWatch(hrp, char, tripId, phase, durationSec)
+    stopCfWatch()
+    if not hrp or not hrp.Parent then return end
+    local watchGen = FarmRuntime.cfWatchGen
+    local t0 = os.clock()
+    local lastPos = hrp.Position
+    local lastLogAt = 0
+    local minInterval = (phase == "after") and 0.04 or 0.12
+    local minDist = (phase == "after") and 0.25 or 8 -- skip tiny tween steps while flying
+
+    local conn
+    conn = hrp:GetPropertyChangedSignal("CFrame"):Connect(function()
+        if watchGen ~= FarmRuntime.cfWatchGen then return end
+        if not hrp.Parent then return end
+        local now = os.clock()
+        if (now - lastLogAt) < minInterval then return end
+        local newPos = hrp.Position
+        local moved = (newPos - lastPos).Magnitude
+        if moved < minDist then return end
+        lastLogAt = now
+        local curChar = LocalPlayer.Character
+        local sameChar = (curChar ~= nil and char ~= nil and curChar == char)
+        local hrpIsCurrent = curChar and hrp:IsDescendantOf(curChar)
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local humState = "?"
+        local humHp = "?"
+        if hum then
+            pcall(function()
+                humState = tostring(hum:GetState())
+                humHp = string.format("%.0f", hum.Health)
+            end)
+        end
+        log("INFO", string.format(
+            "CF_CHANGE phase=%s trip=%s dt=%.3fs moved=%.1f old=%s new=%s anchored=%s sameChar=%s hrpIsCurrent=%s hp=%s state=%s gen=%s",
+            tostring(phase),
+            tostring(tripId),
+            now - t0,
+            moved,
+            fmtPos(lastPos),
+            fmtPos(newPos),
+            tostring(hrp.Anchored),
+            tostring(sameChar),
+            tostring(hrpIsCurrent == true),
+            humHp,
+            humState,
+            tostring(FarmRuntime.generation)
+        ))
+        lastPos = newPos
+    end)
+    FarmRuntime.cfWatchConn = conn
+
+    task.delay(durationSec or 0.5, function()
+        if watchGen == FarmRuntime.cfWatchGen and FarmRuntime.cfWatchConn == conn then
+            stopCfWatch()
+            log("INFO", "CF_WATCH end phase=" .. tostring(phase) .. " trip=" .. tostring(tripId))
+        end
+    end)
+end
+
 -- EE diagnostic: log character / HRP replacements once each time they happen
 pcall(function()
     LocalPlayer.CharacterAdded:Connect(function(char)
-        log("INFO", "Character respawned/replaced gen=" .. tostring(FarmRuntime.generation))
+        stopCfWatch()
+        log("INFO", "Character respawned/replaced gen=" .. tostring(FarmRuntime.generation)
+            .. " trip=" .. tostring(FarmRuntime.tripId))
         pcall(function()
             local hrp = char:WaitForChild("HumanoidRootPart", 5)
             if hrp then
@@ -2021,6 +2102,8 @@ local function tweenTo(cf, speed, gen)
         )
         move.tween = tw
         FarmRuntime.activeTween = tw
+        -- Diagnostic: throttled CFrame observer during flight (not ownership claims)
+        startCfWatch(hrp, char, tripId, "during", math.min(math.max(t + 0.5, 1), 45))
         tw:Play()
         tw.Completed:Wait()
     end)
@@ -2030,11 +2113,13 @@ local function tweenTo(cf, speed, gen)
 
     local endPos = hrp.Parent and fmtPos(hrp.Position) or "?"
     if not ok then
+        stopCfWatch()
         log("WARN", "tweenTo FAIL/CANCEL trip=" .. tostring(tripId)
             .. " gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos)
         return false
     end
     if gen and gen ~= FarmRuntime.generation then
+        stopCfWatch()
         log("INFO", "tweenTo STALE trip=" .. tostring(tripId)
             .. " gen arg=" .. tostring(gen) .. " now=" .. tostring(FarmRuntime.generation) .. " pos=" .. endPos)
         return false
@@ -2043,6 +2128,9 @@ local function tweenTo(cf, speed, gen)
         .. " gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos
         .. " anchored=" .. tostring(hrp.Anchored)
         .. " sameChar=" .. tostring(LocalPlayer.Character == char))
+
+    -- Diagnostic: post-COMPLETE window (snap usually ~0.2s); replaces "during" watcher
+    startCfWatch(hrp, char, tripId, "after", 0.55)
 
     -- Diagnostic only: sample after cleanup. Closures capture THIS tripId (not a later trip).
     local sampleHrp = hrp
