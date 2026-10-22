@@ -26,9 +26,10 @@ local Config = {
     BrandMain      = "E.E.",
     BrandSub       = "Elites Essentials",
 
-    WindowSize     = Vector2.new(560, 340),
-    SidebarWidth   = 58,
-    TitleBarHeight = 40,
+    -- ~90% of original 560x340 for a slightly smaller main window (text sizes unchanged)
+    WindowSize     = Vector2.new(504, 306),
+    SidebarWidth   = 52,
+    TitleBarHeight = 36,
     ToggleKey      = Enum.KeyCode.RightControl, -- hide/show (PC only)
 
     -- Diagnostics
@@ -1680,6 +1681,56 @@ local function stageFarming()
         log("INFO", "Diagnostics log cleared")
     end)
 
+    -- Copy full Diag.Lines history to clipboard (not only the last ~12 visible lines)
+    local copyBtn = new("TextButton", {
+        Name = "CopyLogs", Text = "Copy Logs to Clipboard", AutoButtonColor = false,
+        BackgroundColor3 = T.Surface, Size = UDim2.new(1, 0, 0, 36),
+        Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = T.Text, Parent = Farming.Page,
+    }, { corner(10), stroke(T.Stroke, 1, 0.45) })
+    pcall(function()
+        copyBtn.LayoutOrder = clearBtn.LayoutOrder + 1
+    end)
+    connect(copyBtn.MouseButton1Click, function()
+        local parts = {}
+        for i = 1, #Diag.Lines do
+            local l = Diag.Lines[i]
+            parts[#parts + 1] = string.format("[EE] [%s] %s", tostring(l.kind), tostring(l.msg))
+        end
+        local text = table.concat(parts, "\n")
+        if text == "" then
+            text = "[EE] [INFO] (log buffer is empty)"
+        end
+
+        local ok, err = false, "no clipboard API"
+        -- Common executor clipboard helpers (try in order)
+        if type(setclipboard) == "function" then
+            ok, err = pcall(setclipboard, text)
+        elseif type(toclipboard) == "function" then
+            ok, err = pcall(toclipboard, text)
+        elseif type(Clipboard) == "table" and type(Clipboard.set) == "function" then
+            ok, err = pcall(Clipboard.set, text)
+        else
+            ok = false
+            err = "setclipboard/toclipboard not available in this executor"
+        end
+
+        if ok then
+            log("OK", "Copied " .. tostring(#Diag.Lines) .. " log line(s) to clipboard")
+            Notify("Logs", "Copied " .. tostring(#Diag.Lines) .. " lines to clipboard", 3, T.Blue)
+        else
+            -- Fallback: keep full text in getgenv + print so the user can still recover it
+            pcall(function()
+                getEnv().EliteifiedEssentials_LastLogs = text
+            end)
+            print("[EE] --- BEGIN COPIED LOGS (clipboard unavailable) ---")
+            print(text)
+            print("[EE] --- END COPIED LOGS ---")
+            log("WARN", "Clipboard copy failed: " .. tostring(err)
+                .. " — full log printed to console and saved to getgenv().EliteifiedEssentials_LastLogs")
+            Notify("Logs", "Clipboard unavailable — see console / getgenv", 4, T.Danger)
+        end
+    end)
+
     -- Stop All button
     local stopBtn = new("TextButton", {
         Name = "StopAll", Text = "Stop All", AutoButtonColor = false,
@@ -1687,7 +1738,7 @@ local function stageFarming()
         Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = T.Danger, Parent = Farming.Page,
     }, { corner(10), stroke(T.Danger, 1, 0.5) })
     pcall(function()
-        stopBtn.LayoutOrder = clearBtn.LayoutOrder + 1
+        stopBtn.LayoutOrder = copyBtn.LayoutOrder + 1
     end)
     connect(stopBtn.MouseButton1Click, function()
         State.AutoRandomSurprise = false
