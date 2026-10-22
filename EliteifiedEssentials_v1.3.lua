@@ -15,7 +15,7 @@
     Diagnostics: bottom-left panel + [EE] console lines.
 ]]
 
-print("[EE] Script started - Eliteified Essentials v1.4.2 (post-tween position samples)")
+print("[EE] Script started - Eliteified Essentials v1.4.3 (trip-id diagnostics)")
 
 ----------------------------------------------------------------
 -- 1. CONFIG
@@ -119,8 +119,9 @@ local FarmRuntime = {
     task = nil,
     activeTween = nil,
     generation = 0,
-    -- move: { tween, hrp, wasAnchored } — owned by the active tweenTo; cleared on finish/cancel
+    -- move: { tween, hrp, wasAnchored, tripId } — owned by the active tweenTo; cleared on finish/cancel
     move = nil,
+    tripId = 0, -- diagnostic: increments once per tweenTo attempt
 }
 local FarmUI = {
     modeToggles = {},
@@ -332,11 +333,22 @@ local function Cleanup()
         -- Inline move cleanup (cancelFarmTween is defined later in the file; do not depend on it here)
         local tw = FarmRuntime.activeTween
         local m = FarmRuntime.move
+        local cTrip = (m and m.tripId) or FarmRuntime.tripId or 0
         FarmRuntime.activeTween = nil
         FarmRuntime.move = nil
-        if tw then pcall(function() tw:Cancel() end) end
-        if m and m.tween and m.tween ~= tw then pcall(function() m.tween:Cancel() end) end
+        if tw then
+            pcall(function() log("INFO", "HRP_WRITE Cleanup Cancel tween trip=" .. tostring(cTrip)) end)
+            pcall(function() tw:Cancel() end)
+        end
+        if m and m.tween and m.tween ~= tw then
+            pcall(function() log("INFO", "HRP_WRITE Cleanup Cancel move.tween trip=" .. tostring(cTrip)) end)
+            pcall(function() m.tween:Cancel() end)
+        end
         if m and m.hrp and m.hrp.Parent then
+            pcall(function()
+                log("INFO", "HRP_WRITE Cleanup Anchored=" .. tostring(m.wasAnchored)
+                    .. " trip=" .. tostring(cTrip))
+            end)
             pcall(function() m.hrp.Anchored = m.wasAnchored end)
         end
         if FarmRuntime.task then
@@ -1791,22 +1803,30 @@ local function cancelFarmTween()
     local m = FarmRuntime.move
     local tw = FarmRuntime.activeTween
     local had = (m ~= nil) or (tw ~= nil)
+    local cancelTrip = (m and m.tripId) or FarmRuntime.tripId or 0
     FarmRuntime.move = nil
     FarmRuntime.activeTween = nil
     if tw then
+        log("INFO", "HRP_WRITE cancelFarmTween Cancel tween trip=" .. tostring(cancelTrip))
         pcall(function() tw:Cancel() end)
     elseif m and m.tween then
+        log("INFO", "HRP_WRITE cancelFarmTween Cancel move.tween trip=" .. tostring(cancelTrip))
         pcall(function() m.tween:Cancel() end)
     end
     -- Restore only the HRP this move anchored; ignore if part is gone (respawn)
     if m and m.hrp and m.hrp.Parent then
+        log("INFO", "HRP_WRITE cancelFarmTween Anchored=" .. tostring(m.wasAnchored)
+            .. " trip=" .. tostring(cancelTrip))
         pcall(function() m.hrp.Anchored = m.wasAnchored end)
     end
     -- Also clear any farm-hold anchor (stay-above-NPC) so mode changes never leave you frozen
     pcall(function()
         local char = LocalPlayer and LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if hrp then hrp.Anchored = false end
+        if hrp then
+            log("INFO", "HRP_WRITE cancelFarmTween force Anchored=false trip=" .. tostring(cancelTrip))
+            hrp.Anchored = false
+        end
     end)
     -- Diagnostic only: log when there was something to cancel
     if had then
@@ -1815,7 +1835,8 @@ local function cancelFarmTween()
             local _, hrp = getCharacter()
             if hrp then pos = fmtPos(hrp.Position) end
         end)
-        log("INFO", "cancelFarmTween gen=" .. tostring(FarmRuntime.generation) .. " pos=" .. pos)
+        log("INFO", "cancelFarmTween trip=" .. tostring(cancelTrip)
+            .. " gen=" .. tostring(FarmRuntime.generation) .. " pos=" .. pos)
     end
 end
 
@@ -1831,6 +1852,10 @@ local function tweenTo(cf, speed, gen)
     cancelFarmTween() -- finishes previous move (cancels + unanchors its HRP)
     if gen and gen ~= FarmRuntime.generation then return false end
 
+    -- Diagnostic: unique trip id for this tweenTo attempt (captured by delayed samples)
+    FarmRuntime.tripId = (FarmRuntime.tripId or 0) + 1
+    local tripId = FarmRuntime.tripId
+
     local dist = (hrp.Position - cf.Position).Magnitude
     -- Duration follows configured speed: t = dist / speed (no max cap that defeats the slider)
     local t = dist / speed
@@ -1841,6 +1866,7 @@ local function tweenTo(cf, speed, gen)
         tween = nil,
         hrp = hrp,
         wasAnchored = wasAnchored,
+        tripId = tripId,
     }
 
     -- Own the move slot before any state change; every exit path must release or hand off via cancel.
@@ -1849,7 +1875,8 @@ local function tweenTo(cf, speed, gen)
 
     -- Diagnostic: tween start (once per tween)
     log("INFO", string.format(
-        "tweenTo START gen=%s dist=%.1f from=%s to=%s",
+        "tweenTo START trip=%d gen=%s dist=%.1f from=%s to=%s",
+        tripId,
         tostring(gen or FarmRuntime.generation),
         dist,
         fmtPos(hrp.Position),
@@ -1858,7 +1885,8 @@ local function tweenTo(cf, speed, gen)
 
     local function releaseIfOwner()
         if FarmRuntime.move ~= move then
-            log("INFO", "releaseIfOwner SKIP (not owner) gen=" .. tostring(FarmRuntime.generation))
+            log("INFO", "releaseIfOwner SKIP (not owner) trip=" .. tostring(tripId)
+                .. " gen=" .. tostring(FarmRuntime.generation))
             return -- cancelFarmTween / newer move already cleaned up
         end
         FarmRuntime.move = nil
@@ -1867,17 +1895,23 @@ local function tweenTo(cf, speed, gen)
             FarmRuntime.activeTween = nil
         end
         if hrp.Parent then
+            log("INFO", "HRP_WRITE releaseIfOwner Anchored=" .. tostring(wasAnchored)
+                .. " trip=" .. tostring(tripId))
             pcall(function() hrp.Anchored = wasAnchored end)
         end
-        log("INFO", "releaseIfOwner DONE gen=" .. tostring(FarmRuntime.generation)
+        log("INFO", "releaseIfOwner DONE trip=" .. tostring(tripId)
+            .. " gen=" .. tostring(FarmRuntime.generation)
             .. " pos=" .. fmtPos(hrp.Parent and hrp.Position or nil)
             .. " anchored->" .. tostring(wasAnchored))
     end
 
     -- F1: Create, Play, and Wait are all inside pcall so failures cannot skip restore
     local ok = pcall(function()
+        log("INFO", "HRP_WRITE tweenTo Anchored=true trip=" .. tostring(tripId))
         hrp.Anchored = true
 
+        log("INFO", "HRP_WRITE tweenTo CFrame tween trip=" .. tostring(tripId)
+            .. " to=" .. fmtPos(cf.Position))
         local tw = TweenService:Create(
             hrp,
             TweenInfo.new(t, Enum.EasingStyle.Linear),
@@ -1894,21 +1928,25 @@ local function tweenTo(cf, speed, gen)
 
     local endPos = hrp.Parent and fmtPos(hrp.Position) or "?"
     if not ok then
-        log("WARN", "tweenTo FAIL/CANCEL gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos)
+        log("WARN", "tweenTo FAIL/CANCEL trip=" .. tostring(tripId)
+            .. " gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos)
         return false
     end
     if gen and gen ~= FarmRuntime.generation then
-        log("INFO", "tweenTo STALE gen arg=" .. tostring(gen) .. " now=" .. tostring(FarmRuntime.generation) .. " pos=" .. endPos)
+        log("INFO", "tweenTo STALE trip=" .. tostring(tripId)
+            .. " gen arg=" .. tostring(gen) .. " now=" .. tostring(FarmRuntime.generation) .. " pos=" .. endPos)
         return false
     end
-    log("INFO", "tweenTo COMPLETE gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos
+    log("INFO", "tweenTo COMPLETE trip=" .. tostring(tripId)
+        .. " gen=" .. tostring(gen or FarmRuntime.generation) .. " pos=" .. endPos
         .. " anchored=" .. tostring(hrp.Anchored)
         .. " sameChar=" .. tostring(LocalPlayer.Character == char))
 
-    -- Diagnostic only: sample after cleanup (not every frame). Does not move the character.
+    -- Diagnostic only: sample after cleanup. Closures capture THIS tripId (not a later trip).
     local sampleHrp = hrp
     local sampleChar = char
     local sampleGen = tostring(gen or FarmRuntime.generation)
+    local sampleTrip = tripId
     local function postSample(label)
         local curChar = LocalPlayer.Character
         local sameChar = (curChar ~= nil and sampleChar ~= nil and curChar == sampleChar)
@@ -1916,14 +1954,15 @@ local function tweenTo(cf, speed, gen)
         local hrpIsCurrent = hrpOk and curChar and sampleHrp:IsDescendantOf(curChar)
         if hrpOk then
             log("INFO", string.format(
-                "%s gen=%s pos=%s anchored=%s sameChar=%s hrpIsCurrent=%s",
-                label, sampleGen, fmtPos(sampleHrp.Position),
-                tostring(sampleHrp.Anchored), tostring(sameChar), tostring(hrpIsCurrent == true)
+                "%s trip=%d gen=%s pos=%s anchored=%s sameChar=%s hrpIsCurrent=%s curTrip=%s",
+                label, sampleTrip, sampleGen, fmtPos(sampleHrp.Position),
+                tostring(sampleHrp.Anchored), tostring(sameChar), tostring(hrpIsCurrent == true),
+                tostring(FarmRuntime.tripId)
             ))
         else
             log("INFO", string.format(
-                "%s gen=%s pos=(hrp gone) sameChar=%s hrpIsCurrent=false",
-                label, sampleGen, tostring(sameChar)
+                "%s trip=%d gen=%s pos=(hrp gone) sameChar=%s hrpIsCurrent=false curTrip=%s",
+                label, sampleTrip, sampleGen, tostring(sameChar), tostring(FarmRuntime.tripId)
             ))
         end
     end
@@ -1951,6 +1990,7 @@ local function holdAboveTarget(targetRoot)
     if not FarmRuntime._holdLogged then
         FarmRuntime._holdLogged = true
         log("INFO", "holdAboveTarget BEGIN height=" .. tostring(height)
+            .. " trip=" .. tostring(FarmRuntime.tripId)
             .. " gen=" .. tostring(FarmRuntime.generation)
             .. " at=" .. fmtPos(hrp.Position)
             .. " target=" .. fmtPos(targetRoot.Position))
@@ -1963,6 +2003,12 @@ local function holdAboveTarget(targetRoot)
             hum.PlatformStand = true
             pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
         end
+        -- HRP_WRITE logs only on first hold of streak to avoid spam each attack tick
+        if not FarmRuntime._holdWriteLogged then
+            FarmRuntime._holdWriteLogged = true
+            log("INFO", "HRP_WRITE holdAboveTarget Anchored=true CFrame trip="
+                .. tostring(FarmRuntime.tripId) .. " height=" .. tostring(height))
+        end
         hrp.Anchored = true
         hrp.CFrame = targetRoot.CFrame * CFrame.new(0, height, 0)
     end)
@@ -1971,8 +2017,10 @@ end
 
 local function releaseFarmHold()
     FarmRuntime._holdLogged = false -- allow next holdAboveTarget to log once
+    FarmRuntime._holdWriteLogged = false
     local char, hrp, hum = getCharacter()
     if hrp and hrp.Parent then
+        log("INFO", "HRP_WRITE releaseFarmHold Anchored=false trip=" .. tostring(FarmRuntime.tripId))
         pcall(function()
             hrp.Anchored = false
             hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
