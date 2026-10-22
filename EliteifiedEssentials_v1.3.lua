@@ -268,7 +268,11 @@ local function protect(gui)
     pcall(function() if typeof(protectgui) == "function" then protectgui(gui) end end)
 end
 
-local function createDiagGui()
+-- Forward declarations so close-button + toggle share one hide/show path
+local createDiagGui
+local setLogsVisible
+
+createDiagGui = function()
     if not Config.Diagnostics or Diag.Gui then return end
     local ok, err = pcall(function()
         local container = getContainer("PlayerGui") or getContainer("gethui") or getContainer("CoreGui")
@@ -304,14 +308,39 @@ local function createDiagGui()
             TextColor3 = T.TextDim, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -4, 0, 4),
             Size = UDim2.fromOffset(20, 20), Parent = panel,
         })
+        -- Hide panel (do not destroy): preserves Diag.Lines and avoids duplicate ScreenGuis
         close.MouseButton1Click:Connect(function()
-            pcall(function() g:Destroy() end)
-            Diag.Gui, Diag.Label = nil, nil
+            setLogsVisible(false)
         end)
         Diag.Gui = g
+        Diag.Visible = true
         refreshDiag()
     end)
     if not ok then warn("[EE] [WARN] Diagnostics panel unavailable: " .. tostring(err)) end
+end
+
+-- Show/hide diagnostics panel without clearing Diag.Lines history
+setLogsVisible = function(visible)
+    visible = visible and true or false
+    if visible then
+        if not Diag.Gui then
+            createDiagGui()
+        end
+        if Diag.Gui then
+            pcall(function() Diag.Gui.Enabled = true end)
+            refreshDiag()
+        end
+    else
+        if Diag.Gui then
+            pcall(function() Diag.Gui.Enabled = false end)
+        end
+    end
+    Diag.Visible = visible
+    if FarmUI and FarmUI.logsToggleBtn then
+        pcall(function()
+            FarmUI.logsToggleBtn.Text = visible and "Hide Logs" or "Show Logs"
+        end)
+    end
 end
 
 local function finishDiag(success)
@@ -320,8 +349,8 @@ local function finishDiag(success)
     if delaySec and delaySec > 0 then
         task.delay(delaySec, function()
             if not Diag.Failed and Diag.Gui then
-                pcall(function() Diag.Gui:Destroy() end)
-                Diag.Gui, Diag.Label = nil, nil
+                -- Hide only; keep Gui so Show Logs can reopen without recreating
+                setLogsVisible(false)
             end
         end)
     end
@@ -1681,6 +1710,28 @@ local function stageFarming()
         log("INFO", "Diagnostics log cleared")
     end)
 
+    -- Show / Hide Logs (panel only; Diag.Lines history is never cleared by this)
+    local logsToggleBtn = new("TextButton", {
+        Name = "ToggleLogs", Text = "Hide Logs", AutoButtonColor = false,
+        BackgroundColor3 = T.Surface, Size = UDim2.new(1, 0, 0, 36),
+        Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = T.Text, Parent = Farming.Page,
+    }, { corner(10), stroke(T.Stroke, 1, 0.45) })
+    pcall(function()
+        logsToggleBtn.LayoutOrder = clearBtn.LayoutOrder + 1
+    end)
+    FarmUI.logsToggleBtn = logsToggleBtn
+    connect(logsToggleBtn.MouseButton1Click, function()
+        local open = Diag.Gui and Diag.Gui.Enabled ~= false and Diag.Visible ~= false
+        setLogsVisible(not open)
+        log("INFO", "Logs panel " .. ((Diag.Visible and "shown") or "hidden"))
+    end)
+    -- Sync label with actual panel state after load
+    pcall(function()
+        local open = Diag.Gui ~= nil and Diag.Gui.Enabled ~= false
+        logsToggleBtn.Text = open and "Hide Logs" or "Show Logs"
+        Diag.Visible = open
+    end)
+
     -- Copy full Diag.Lines history to clipboard (not only the last ~12 visible lines)
     local copyBtn = new("TextButton", {
         Name = "CopyLogs", Text = "Copy Logs to Clipboard", AutoButtonColor = false,
@@ -1688,7 +1739,7 @@ local function stageFarming()
         Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = T.Text, Parent = Farming.Page,
     }, { corner(10), stroke(T.Stroke, 1, 0.45) })
     pcall(function()
-        copyBtn.LayoutOrder = clearBtn.LayoutOrder + 1
+        copyBtn.LayoutOrder = logsToggleBtn.LayoutOrder + 1
     end)
     connect(copyBtn.MouseButton1Click, function()
         local parts = {}
